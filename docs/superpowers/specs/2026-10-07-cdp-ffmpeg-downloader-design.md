@@ -38,6 +38,7 @@
 - A2：以 toggle 方式開啟時，CDP 埠為 `127.0.0.1:9222`，且 `DevToolsActivePort` 的 port 與之相同。
 - A3：Deno 原生 `WebSocket` 客戶端（不自訂 Origin header）可以成功連上 toggle 模式的 browser endpoint。
 - A4：`deno desktop` 預設 webview backend 下，`bindings` 與以 `with { type: "text" }` 匯入的 UI 檔案在 `--hmr` 開發模式與 `-o` 建置產物中都能正常運作。
+- A6：預設 webview backend 下，視窗 `close` 事件的 `preventDefault()` 能取消關閉，且自訂選單項目的 `CmdOrCtrl+Q` accelerator 會觸發 `menuclick`（文件已說明，但需在實機確認）。
 - A5：toggle 模式下 `Target.getTargets`、`Target.attachToTarget`（flatten）、`Runtime.evaluate` 不受限制。
 
 ## 4. 架構
@@ -292,8 +293,10 @@ type JobStatus =
 
 暫存清理：
 
-- App 啟動時刪除系統暫存目錄下所有 `ffdl-` 開頭的目錄（上次異常結束的殘留）；系統暫存目錄以「建立一個新暫存目錄、取其上層、再刪掉它」的方式取得。
-- 視窗 `close` 事件時，若有進行中的 ffmpeg 先 cancel，並以同步方式刪除目前的暫存目錄（盡力而為）。
+- App 啟動時（上次異常結束的殘留）：
+  - 刪除系統暫存目錄下所有 `ffdl-` 開頭的目錄；系統暫存目錄以「建立一個新暫存目錄、取其上層、再刪掉它」的方式取得。
+  - 刪除目前 `outputDir` 中符合 `.*.ffdl-*.part` 的檔案（中斷的跨裝置發佈殘檔）。
+- 正常結束時的收尾見 §6.11。
 
 CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`connected: boolean`。`connect()` 已連線時直接回傳；連線關閉時 `connected` 變 false，若當下為 extracting，該次擷取以失敗結束。
 
@@ -320,8 +323,34 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 | `revealInFinder` | `(path: string) => void` | 執行 `open -R <path>` |
 
 - bindings 內丟出的錯誤以訊息字串傳回頁面端，由 UI 顯示。
+- 應用程式選單以 `win.setApplicationMenu()` 自訂（不使用 OS 處理、JS 攔截不到的 `role: "quit"`）：
+  - 第一個 submenu（macOS 應用程式選單）：自訂項目 `{ item: { label: "結束 FFmpeg Downloader", id: "quit", accelerator: "CmdOrCtrl+Q", enabled: true } }`。
+  - 「編輯」submenu：`undo`、`redo`、`cut`、`copy`、`paste`、`selectAll` role，讓檔名與設定輸入框的快捷鍵正常運作。
+  - `menuclick` 事件 `e.detail.id === "quit"` 時進入 §6.11 的結束流程。
 
-### 6.11 UI（`ui/`）
+### 6.11 結束流程（shutdown）
+
+觸發來源：視窗 `close` 事件（關閉按鈕、Cmd+W）與自訂選單的「結束」（Cmd+Q）。兩者走同一個 `requestShutdown()`：
+
+1. `close` 事件中一律先呼叫 `e.preventDefault()`（`deno desktop` 支援以此取消關閉，見 MEMORY 研究結論）。若已在結束流程中，忽略重複觸發。
+2. `job.shutdown({ deadlineMs = 10000 })`：
+   1. 同步設定 `shuttingDown = true`；之後所有會改變狀態的 binding（`connect`、`extract`、`startProcess`、`discard`、`reset`、`saveSettings`）一律丟出「程式正在結束」。
+   2. 以 `win.executeJs("window.__showShuttingDown?.()")` 讓 UI 顯示「正在結束…」遮罩（失敗忽略）。
+   3. 依目前狀態收尾：
+      - extracting：關閉 CDP 連線，使進行中的 CDP 請求立即以 `CdpClosedError` reject，擷取流程進入 failed 並清理暫存目錄。
+      - processing / preparing：觸發 `AbortController`，等 ffprobe 子行程結束。
+      - processing / running：走 `cancel()`（SIGTERM，3 秒後 SIGKILL），等 ffmpeg 子行程結束。
+      - processing / publishing：**等待發佈完成**，不中斷，避免輸出資料夾出現半成品或毀掉既有檔案。
+      - ready：與 `discard()` 相同，但等刪除完成。
+      - 其他狀態：無需處理。
+   4. 等上述工作的 `finally`（暫存目錄清理）完成。
+   5. 關閉 CDP 連線（若仍開著）。
+   6. **硬性期限**：整個 shutdown 超過 `deadlineMs` 時，對仍存活的子行程同步送 SIGKILL，不再等待，直接進入下一步。此時若正在跨裝置發佈，可能留下 `.part` 殘檔，由下次啟動的清理處理（§6.9）。
+3. shutdown 完成後設定旗標，使下一次 `close` 事件不再 `preventDefault`，呼叫 `win.close()`，接著 `Deno.exit(0)`。
+
+無法攔截的結束方式（Dock 圖示右鍵的「結束」、強制結束、當機、斷電）不保證收尾，由啟動時的殘留清理補救（§6.9；見 §10）。
+
+### 6.12 UI（`ui/`）
 
 單頁。**畫面由 `(JobStatus.state, connected)` 決定**，job 狀態優先於連線狀態：
 
@@ -345,6 +374,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。
 6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。有 `cleanupWarning` 時額外顯示「暫存檔未能刪除：<路徑>」提醒。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
+- `app.js` 定義 `window.__showShuttingDown()`，顯示覆蓋全畫面的「正在結束…」遮罩並停止輪詢（§6.11）。
 - 分頁清單畫面上的 binding 呼叫若回報連線已關閉，`connected` 變 false，依上表回到連線畫面。
 
 ## 7. 建置與執行
@@ -364,7 +394,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 | CDP 埠未開啟 | 連線畫面引導 + 自動重探 |
 | `DevToolsActivePort` 不存在 / 格式錯誤 / port 不符 | `connect()` 失敗，顯示 §6.3 的訊息 |
 | 使用者在 Chrome 拒絕授權或逾時 | `connect()` 失敗，提示可再試 |
-| 連線中途斷開 | `connected=false`；進行中的擷取失敗；ready / processing / 結果畫面不受影響，工作回到 idle 後才顯示連線畫面（§6.11） |
+| 連線中途斷開 | `connected=false`；進行中的擷取失敗；ready / processing / 結果畫面不受影響，工作回到 idle 後才顯示連線畫面（§6.12） |
 | 頁面腳本例外 / 回傳格式不符 | failed(extract)，顯示例外訊息 |
 | 擷取中分頁關閉或重新載入 | failed(extract)，訊息見 §6.6 |
 | ffmpeg 無法執行 | 設定頁顯示錯誤，停用「開始處理」 |
@@ -383,6 +413,8 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 - **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready）、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
+- **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe）、running（真 ffmpeg）、publishing（以 `copyThenRename` 分支發佈較大的檔案）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、publishing 時等到發佈完成（最終檔存在且完整）、shutdown 期間呼叫 `startProcess` 等動作被拒。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
+- **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.x.mp4.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
 - **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真 Chrome 無法自動化）：
@@ -392,7 +424,8 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
   4. 擷取中關閉該分頁 → 顯示分頁已關閉的錯誤。
   5. 處理中按取消 → 輸出資料夾無殘檔、暫存目錄已刪除。
   6. `PROBE_DURATION=false` → 顯示不確定進度條。
-  7. `deno task build` 產出的 `.app` 能開啟並完成上述流程（A4）。
+  7. 處理中按視窗關閉鈕、以及按 Cmd+Q → 顯示「正在結束…」，數秒內關閉；之後 `ps` 中沒有殘留的 ffmpeg，暫存目錄已刪除（A6）。
+  8. `deno task build` 產出的 `.app` 能開啟並完成上述流程（A4）。
 
 ## 10. Non-goals / Accepted limitations
 
@@ -404,6 +437,8 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 - 不支援遠端（非本機）且需驗證的 CDP 端點。
 - 檔案大小以「數十 MB 以內」為設計目標；未針對 GB 級檔案最佳化（仍以 4 MiB 分塊、串流寫檔，不會整檔載入 Deno 記憶體，但頁面端需同時持有兩個 buffer）。
 - UI 只提供繁體中文。
+- 無法攔截的結束方式（Dock 右鍵「結束」、強制結束、當機、斷電）不保證收尾：可能殘留子行程以外的暫存目錄與 `.part` 檔，由下次啟動清理；若期間修改過 `outputDir`，舊資料夾中的 `.part` 不會被清理。
+- 擷取中結束程式時 CDP 連線直接關閉，頁面端 `window.__ffdl[token]` 可能殘留到該分頁重新載入為止。
 - **輸出檔撞名競態**
   - Concern：使用者選擇不覆蓋（或確認時檔案不存在）之後，若 ffmpeg 處理期間有其他程式在輸出資料夾建立同名檔，最後發佈時的 rename 會靜默取代該檔。
   - Decision：不實作（不使用「不取代」的原子發佈、不在撞名時保留成品重新詢問）。
