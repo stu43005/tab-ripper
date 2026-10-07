@@ -252,7 +252,8 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 
 ### 6.8 `ffmpeg.ts`
 
-- `checkTool(path: string): Promise<{ ok: boolean; version?: string; error?: string }>`：執行 `<path> -version`，取第一行為版本。
+- **子行程登記**：`ffmpeg.ts` 啟動的所有子行程（`checkTool`、`probeDuration`、`runFfmpeg`）都登記在模組內的集合中，結束時移除；提供 `killAllChildren(): void`（同步對所有登記中的子行程送 SIGKILL），供 §6.11 的兩條結束路徑使用。
+- `checkTool(path: string, timeoutMs = 5000): Promise<{ ok: boolean; version?: string; error?: string }>`：執行 `<path> -version`，取第一行為版本。逾時 → SIGKILL 子行程並等它結束，回傳 `{ ok: false, error: "執行逾時（5 秒），請確認路徑是否正確" }`；因此 `getSettings` / `saveSettings` 最多等待約 5 秒（兩個工具並行檢查）。
 - `probeDuration(ffprobePath: string, file: string, signal: AbortSignal, timeoutMs = 15000): Promise<number | null>`：執行 `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 <file>`，解析為正數秒；失敗、非數字或逾時 → `null`（不視為錯誤）。逾時或 `signal` 觸發時 kill 子行程並等待它結束後才 resolve（`signal` 觸發時同樣回傳 `null`，由呼叫端依 `cancelRequested` 判斷結果）。
 - `parseProgress(chunk: string, state: ProgressState): ProgressEvent[]`：純函式，逐行解析 `key=value`；以 `out_time_us`（缺少時用 `out_time_ms`，ffmpeg 中兩者單位皆為微秒）換算秒數，值為 `N/A` 時忽略；解析 `speed`（如 `1.5x`，`N/A` → `null`）；遇到 `progress=continue|end` 發出一筆事件 `{ outTimeSec, speed, ended }`。需處理跨 chunk 被截斷的行（`state` 保留殘餘字串）。
 - `runFfmpeg(opts): FfmpegRun`：
@@ -374,12 +375,12 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
    4. 等上述工作的 `finally`（暫存目錄清理）完成。
    5. 關閉 CDP 連線（若仍開著）。
    6. **硬性期限**：整個 shutdown 超過 `deadlineMs` 時，對仍存活的子行程同步送 SIGKILL，不再等待，直接進入下一步。此時若正在跨裝置發佈，可能留下 `.part` 殘檔，由下次啟動的清理處理（§6.9）。
-   7. 最後再次確認所有子行程（ffmpeg、ffprobe）都已結束；仍存活者同步 SIGKILL。因為 `Deno.exit()` **不會**終止子行程（§3.1 實測），這一步是避免孤兒行程的唯一保障。
+   7. 最後呼叫 `killAllChildren()`（§6.8），對仍存活的子行程（含工具檢查）同步 SIGKILL。因為 `Deno.exit()` **不會**終止子行程（§3.1 實測），這一步是避免孤兒行程的唯一保障。
 3. 設定 `shutdownDone = true`，呼叫 `win.close()`，接著 `Deno.exit(0)`。
 
 **B. 立即結束：視窗關閉鈕、Cmd+W**。視窗與行程會立即終止，無法等待任何非同步工作。`close` 事件處理函式只做**同步、盡力而為**的收尾（`shutdownDone` 為 true 時直接略過）：
 
-1. 對仍存活的 ffmpeg / ffprobe 子行程同步呼叫 `kill("SIGKILL")`（實測此路徑子行程也會被一起終止，這是額外保險）。
+1. 呼叫 `killAllChildren()`（§6.8）同步 SIGKILL 所有子行程（實測此路徑子行程也會被一起終止，這是額外保險）。
 2. 以 `Deno.removeSync(tempDir, { recursive: true })` 嘗試刪除目前的暫存目錄（錯誤忽略；可能因行程終止而未完成）。
 3. 不處理 CDP 連線、不等待發佈。正在發佈時：同磁碟 rename 是原子操作，最終檔不會半成品；跨裝置複製被中斷只會留下 `.part`。
 
@@ -453,6 +454,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
 - **連線管理**：以延遲回應 WebSocket upgrade 的假 CDP server 模擬「等待授權」：重疊呼叫兩次 `connect()` 時 server 只收到一次連線；連線等待中呼叫 `shutdown()`，連線完成後立即被關閉、`connect()` 以「程式正在結束」失敗；舊 client 關閉後才觸發的 `closed` 處理函式不會把新連線標成中斷。
 - **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.x.mp4.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
+- **工具檢查逾時**：以 `-version` 永不結束的假執行檔腳本呼叫 `checkTool`（縮短 `timeoutMs`），驗證回傳 `ok: false`、子行程已結束且已從登記集合移除；`killAllChildren()` 能終止登記中的懸置子行程。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
 - **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真實瀏覽器無法自動化；以 Brave 執行）：
