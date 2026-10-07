@@ -1255,12 +1255,40 @@ import {
   activeChildCount,
   checkTool,
   killAllChildren,
+  newProgressState,
+  parseProgress,
   probeDuration,
+  type ProgressEvent,
   type ProgressUpdateCallback,
   runFfmpeg,
 } from "../src/ffmpeg.ts";
 import type { ProgressUpdate } from "../src/types.ts";
 import { FFMPEG, makeExecutable, makeTempDir, makeTestVideo, pathExists, waitFor } from "./helpers/fixtures.ts";
+
+Deno.test({
+  name: "parseProgress sees the terminal progress=end event in real ffmpeg output",
+  ignore: !FFMPEG,
+  fn: async () => {
+    const dir = await makeTempDir();
+    try {
+      const video = await makeTestVideo(dir, 3);
+      const out = await new Deno.Command("ffmpeg", {
+        args: ["-hide_banner", "-progress", "pipe:1", "-y", "-i", video, "-c", "copy", join(dir, "out.mp4")],
+        stdout: "piped",
+        stderr: "null",
+      }).output();
+      assert(out.success);
+      const events: ProgressEvent[] = parseProgress(new TextDecoder().decode(out.stdout), newProgressState());
+      assert(events.length > 0);
+      const last = events[events.length - 1];
+      assertEquals(last.ended, true);
+      assert(events.slice(0, -1).every((event) => !event.ended));
+      assert(last.outTimeSec > 2.5, `outTimeSec ${last.outTimeSec}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
 
 Deno.test({
   name: "checkTool reports the ffmpeg version line",
@@ -1567,7 +1595,7 @@ Move the `import type` line to the top of the file (imports must precede other s
 - [ ] **Step 4: Run test to verify it fails**
 
 Run: `deno task test tests/ffmpeg_process_test.ts`
-Expected: every test FAILs with `Error: not implemented` (ffmpeg tests are reported as `ignored` only if ffmpeg is missing; on this machine ffmpeg 8.0 is installed, so they run and fail).
+Expected: every test that calls this task's functions FAILs with `Error: not implemented` (ffmpeg tests are reported as `ignored` only if ffmpeg is missing; on this machine ffmpeg 8.0 is installed, so they run and fail). The one exception is `parseProgress sees the terminal progress=end event in real ffmpeg output`: it feeds real ffmpeg output to Task 7's already-implemented parser and passes here — it is an integration check of Task 7, not of this task's skeleton.
 
 - [ ] **Step 5: Implement** — replace the skeleton functions in `src/ffmpeg.ts` with:
 
@@ -1746,7 +1774,7 @@ export function runFfmpeg(opts: FfmpegRunOptions): FfmpegRun {
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `deno task test tests/ffmpeg_process_test.ts`
-Expected: `ok | 15 passed | 0 failed`.
+Expected: `ok | 16 passed | 0 failed`.
 
 - [ ] **Step 7: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -3536,7 +3564,7 @@ const READ_TIMEOUT_MS = 60_000;
 const DETACH_TIMEOUT_MS = 3_000;
 const MISSING_DATA = "FFDL_MISSING";
 
-/** An exception thrown inside the page; message is the description's first line. */
+/** An exception thrown inside the page; message is its full CDP description. */
 class PageException extends Error {}
 
 interface EvaluateResponse {
@@ -3726,7 +3754,7 @@ function settingsFor(cdpAddress: string): Settings {
   return { cdpAddress, outputDir: "/tmp/tab-ripper-unused", ffmpegPath: "ffmpeg", ffprobePath: "ffprobe" };
 }
 
-async function closedPortAddress(): Promise<string> {
+function closedPortAddress(): string {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const { port } = listener.addr as Deno.NetAddr;
   listener.close();
@@ -3783,7 +3811,7 @@ Deno.test({
   name: "connect failure explains how to fix it and can be retried",
   ...opts,
   fn: async () => {
-    const address = await closedPortAddress();
+    const address = closedPortAddress();
     const job = new JobManager(settingsFor(address));
     const error = await assertRejects(() => job.connect(), Error, `無法連線到 ${address}`);
     assertStringIncludes((error as Error).message, "chrome://inspect/#remote-debugging");
@@ -3797,7 +3825,7 @@ Deno.test({
   ...opts,
   fn: async () => {
     const server = new FakeCdpServer({ handler: fakePage().handler });
-    const job = new JobManager(settingsFor(await closedPortAddress()));
+    const job = new JobManager(settingsFor(closedPortAddress()));
     try {
       job.updateSettings(settingsFor(server.address));
       await job.connect();
@@ -3841,7 +3869,7 @@ Deno.test({
     try {
       const connecting = job.connect();
       connecting.catch(() => {});
-      job.updateSettings(settingsFor(await closedPortAddress()));
+      job.updateSettings(settingsFor(closedPortAddress()));
       await assertRejects(() => connecting, Error, ADDRESS_CHANGED_MESSAGE);
       assertEquals(job.isConnected(), false);
       await waitFor(
@@ -6096,6 +6124,7 @@ const ui = {
   pollTimer: null,
   polling: false,
   refreshQueued: false,
+  startPending: false,
   probeTimer: null,
   resultPath: null,
 };
@@ -6208,7 +6237,9 @@ function render(status) {
       break;
     case "ready":
       stopProbing();
-      stopPolling();
+      // While a start request is pending, a stale "ready" snapshot must not
+      // stop polling: the backend may already be preparing.
+      if (!ui.startPending) stopPolling();
       renderPreview(status);
       break;
     case "processing":
@@ -6384,8 +6415,14 @@ async function startProcessing() {
     for (;;) {
       // Poll while the binding is pending: destination checks can be slow,
       // and the processing screen (with its cancel button) must show at once.
+      ui.startPending = true;
       startPolling();
-      const result = await bindings.startProcess(filename, confirmed);
+      let result;
+      try {
+        result = await bindings.startProcess(filename, confirmed);
+      } finally {
+        ui.startPending = false;
+      }
       if (!result.needsConfirm) break;
       await refresh(); // Back to the preview behind the confirmation dialog.
       if (!confirm(`檔案已存在，要覆蓋嗎？\n${result.finalPath}`)) return;
@@ -6545,12 +6582,20 @@ async function saveSettingsFromForm() {
   for (const key of SETTING_KEYS) next[key] = form.elements.namedItem(key).value.trim();
   try {
     const result = await bindings.saveSettings(next);
+    // The settings are in effect even if writing the file failed.
     ui.settings = next;
     ui.tools = result.tools;
     renderTools();
-    showError("settings-error", null);
-    $("settings-dialog").close();
+    if (result.persistError) {
+      // Keep the dialog open so the write failure stays visible.
+      showError("settings-error", result.persistError);
+    } else {
+      showError("settings-error", null);
+      $("settings-dialog").close();
+    }
   } catch (error) {
+    // Rejected before anything was applied (validation, or a CDP address
+    // change while extracting): settings are unchanged.
     showError("settings-error", error);
     return;
   }
@@ -6697,14 +6742,15 @@ win.bind("saveSettings", async (next: Settings) => {
   validateSettings(candidate);
   job.updateSettings(candidate);
   settings = candidate;
+  // A failed write is a partial success: the new settings are already in
+  // effect, so return the fresh tool checks together with the error.
+  let persistError: string | null = null;
   try {
     await saveSettings(candidate);
   } catch (error) {
-    throw new Error(
-      `設定已套用但未能寫入設定檔：${error instanceof Error ? error.message : String(error)}`,
-    );
+    persistError = `設定已套用但未能寫入設定檔：${error instanceof Error ? error.message : String(error)}`;
   }
-  return { tools: await checkTools(candidate) };
+  return { tools: await checkTools(candidate), persistError };
 });
 
 win.bind("probe", async () => ({ open: await probeCdpPort(settings.cdpAddress), address: settings.cdpAddress }));
@@ -6916,10 +6962,12 @@ Then run `deno task build`.
 
 - [ ] **Step 3: Record results** — report each item's PASS/FAIL with observations to the user. Any FAIL is handled with root-cause analysis before changing code (project rules), then the affected task's tests are extended first.
 
-- [ ] **Step 4: Restore the user files** — with the `BACKUP` path recorded in Step 1: `cp "$BACKUP"/* user/`, then `diff -r "$BACKUP" user/` prints nothing; only then remove the backup with `rm -r "$BACKUP"`.
+- [ ] **Step 4: Restore the user files** — with the `BACKUP` path recorded in Step 1, copy back exactly the four backed-up files: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cp "$BACKUP/$f" "user/$f"; done`. Verify each one: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cmp "$BACKUP/$f" "user/$f"; done` prints nothing (other files the user may keep in `user/` were never touched). Only then remove the backup with `rm -r "$BACKUP"`.
 
-- [ ] **Step 5: Final gate** — the automated suite assumes the committed default `user/` files (example.com pattern, `Clip.mp4` default name, duration probing on). Run it against those defaults even if the restored `user/` files are customised:
-  1. If `git status --short user/` prints anything, run `git stash push -- user/` (version-control operation; it parks the user's customisations).
-  2. Run `deno task check && deno task lint && deno fmt --check && deno task test` — all must pass.
-  3. If you stashed in 1., run `git stash pop`, then `git status --short user/` shows the user's changes again.
-  4. Run `deno task check && deno task build` on the user's configuration — both must succeed.
+- [ ] **Step 5: Final gate** — the automated suite assumes the committed default `user/` files (example.com pattern, `Clip.mp4` default name, duration probing on). Run it against those defaults even if the restored `user/` tree is customised:
+  1. Record the stash count: `git stash list | wc -l` → `N_BEFORE`.
+  2. If `git status --short --untracked-files=all user/` prints anything, run `git stash push --include-untracked -m tab-ripper-final-gate -- user/` (version-control operation; it parks tracked and untracked customisations under `user/`).
+  3. Record `git stash list | wc -l` → `N_AFTER`. A stash was created by this step only if `N_AFTER` is `N_BEFORE + 1` and `git stash list -1` shows `tab-ripper-final-gate`.
+  4. Run `deno task check && deno task lint && deno fmt --check && deno task test` — all must pass.
+  5. Only if step 3 confirmed the stash: `git stash pop --index` (restores staged and unstaged state), then `git status --short --untracked-files=all user/` shows the user's changes again. Never pop a stash this task did not create.
+  6. Run `deno task check && deno task build` on the user's configuration — both must succeed.
