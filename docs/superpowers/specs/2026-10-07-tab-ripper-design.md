@@ -494,6 +494,14 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
   - Concern：擷取完成（或失敗、逾時後腳本才完成）時，`window.__ffdl[token]` 中的 main/aux buffer（各可能數十 MB）會留在分頁記憶體中；同一分頁多次擷取會累積。
   - Decision：不清理（不送 delete 運算式、不使用取消標記）。
   - Rationale：使用者裁決；通常每個網頁只擷取一次，即使累積，重新整理分頁即可釋放，不值得為此維護清理與取消標記的生命週期。
+- **wrapper script 的子孫行程**
+  - Concern：`ffmpegPath` / `ffprobePath` 若設成 wrapper script，且 script 不是以 `exec` 啟動真正的工具，取消、逾時與結束流程只會終止 script 本身；子孫行程可能存活並持有 stdout/stderr，使讀取等不到 EOF。
+  - Decision：不實作行程群組（process tree）終止與串流讀取逾時。
+  - Rationale：使用者裁決；路徑應直接指向 ffmpeg/ffprobe 執行檔（或以 `exec` 轉交的 wrapper），`Deno.Command` 也沒有直接的行程群組 API，成本與風險不成比例。
+- **設定檔非原子寫入**
+  - Concern：`saveSettings` 直接覆寫 `settings.json`；磁碟已滿或寫入途中程式被終止時，舊的有效設定可能毀損；重疊的儲存呼叫沒有定義順序。
+  - Decision：不實作暫存檔 + rename 的原子寫入與儲存排隊。
+  - Rationale：使用者裁決；設定只有 4 個欄位，毀損時下次啟動會退回預設值並顯示警告（§6.1），使用者可立即重新設定。
 - **輸出檔撞名競態**
   - Concern：使用者選擇不覆蓋（或確認時檔案不存在）之後，若 ffmpeg 處理期間有其他程式在輸出資料夾建立同名檔，最後發佈時的 rename 會靜默取代該檔。
   - Decision：不實作（不使用「不取代」的原子發佈、不在撞名時保留成品重新詢問）。
