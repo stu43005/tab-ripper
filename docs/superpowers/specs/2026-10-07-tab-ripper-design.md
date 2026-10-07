@@ -147,7 +147,8 @@ export function defaultFilename(info: Info): string {
 import type { FfmpegArgsContext } from "../src/types.ts";
 
 /** Return ffmpeg arguments WITHOUT the leading global options the app adds
- *  (-hide_banner -nostats -progress pipe:1 -y). Must write to ctx.outputPath. */
+ *  (-hide_banner -stats -progress pipe:1 -y). Must write to ctx.outputPath.
+ *  Do not add -nostats: the live status message relies on ffmpeg's stats line. */
 export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
   return ["-i", ctx.mainPath, "-c", "copy", ctx.outputPath];
 }
@@ -252,9 +253,11 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 - `parseProgress(chunk: string, state: ProgressState): ProgressEvent[]`：純函式，逐行解析 `key=value`；以 `out_time_us`（缺少時用 `out_time_ms`，ffmpeg 中兩者單位皆為微秒）換算秒數，值為 `N/A` 時忽略；解析 `speed`（如 `1.5x`，`N/A` → `null`）；遇到 `progress=continue|end` 發出一筆事件 `{ outTimeSec, speed, ended }`。需處理跨 chunk 被截斷的行（`state` 保留殘餘字串）。
 - `runFfmpeg(opts): FfmpegRun`：
   - `opts = { ffmpegPath, args, durationSec: number | null, onProgress }`。
-  - 實際參數：`["-hide_banner", "-nostats", "-progress", "pipe:1", "-y", ...args]`。
-  - stdout 交給 `parseProgress`；`onProgress({ percent, outTimeSec, durationSec, speed })`，其中 `percent = durationSec ? min(100, outTimeSec / durationSec * 100) : null`。
-  - stderr 保留最後 200 行的環狀緩衝區。
+  - 實際參數：`["-hide_banner", "-stats", "-progress", "pipe:1", "-y", ...args]`。`-stats` 是必要的：實測 ffmpeg 8.0 在 stderr 非 TTY 且使用 `-progress` 時，不加 `-stats` 就完全不輸出 `frame=… time=… speed=…` 狀態行。
+  - stdout 交給 `parseProgress`；`onProgress({ percent, outTimeSec, durationSec, speed, message })`，其中 `percent = durationSec ? min(100, outTimeSec / durationSec * 100) : null`，`message` 見下。
+  - stderr 交給純函式 `splitStderr(chunk: string, state: StderrState): { segment: string; transient: boolean }[]`：以 `\r` 與 `\n` 切段（處理跨 chunk 截斷、`\r\n` 視為一個 `\n`），去除前後空白、略過空段；以 `\r` 結尾的段標為 `transient: true`（實測：處理中的狀態行以 `\r` 分隔、最後一行以 `\n` 結尾）。
+    - **目前狀態訊息** `message`：最後一個段（不論是否 transient），即「ffmpeg 輸出的最後一行」，通常是 `frame=… size=… time=… bitrate=… speed=… elapsed=…`，出現警告時則是警告內容。每次更新都觸發一次 `onProgress`（沿用最新的進度數值）。
+    - **錯誤摘要**：只有非 transient 的段才放進最後 200 行的環狀緩衝區（`stderrTail`），避免每 0.5 秒一行的狀態行把真正的錯誤訊息擠掉。
   - 回傳 `{ done: Promise<{ code: number; stderrTail: string[] }>, cancel(): void }`；`cancel()` 送 `SIGTERM`，3 秒內未結束再送 `SIGKILL`。
 
 ### 6.9 `job.ts`（狀態機）
@@ -270,7 +273,8 @@ type JobStatus =
       lastError?: string }   // set when returning to ready after a destination failure
   | { state: "processing"; phase: "preparing" | "running" | "publishing";
       percent: number | null; outTimeSec: number;
-      durationSec: number | null; speed: number | null }
+      durationSec: number | null; speed: number | null;
+      message: string | null }   // last stderr line from ffmpeg (running phase only)
   | { state: "done"; outputPath: string; cleanupWarning?: string }
   | { state: "failed"; stage: "extract" | "process"; message: string; detail?: string[];
       cleanupWarning?: string }
@@ -408,7 +412,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 2. **分頁清單**：`listTabs()` 結果（標題、URL），可「重新整理」；無符合分頁時顯示空狀態與目前的 `URL_PATTERN`。點選分頁 → `extract()`。
 3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組，並顯示提示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」（§6.11 B）。
 4. **預覽**：`lastError` 存在時在頂端顯示錯誤橫幅（例如「輸出失敗：磁碟空間不足，可修改檔名或到設定更換輸出資料夾後重試」）；info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`（從目的地失敗回來時保留使用者上次輸入的檔名）；「開始處理」與「取消」（`discard()`）。第一次以 `startProcess(filename, null)` 呼叫；回傳 `needsConfirm` 時以原生 `confirm()` 顯示 `finalPath` 詢問是否覆蓋，同意則以 `startProcess(filename, finalPath)` 重呼叫。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
-5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。同樣顯示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」提示。
+5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；進度條下方以等寬字型單行顯示 `message`（ffmpeg 輸出的最後一行，過長時以省略號截斷、滑鼠移上顯示全文）；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。同樣顯示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」提示。
 6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。有 `cleanupWarning` 時額外顯示「暫存檔未能刪除：<路徑>」提醒。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
 - `app.js` 定義 `window.__showShuttingDown()`，顯示覆蓋全畫面的「正在結束…」遮罩並停止輪詢（§6.11）。
@@ -448,10 +452,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 使用 `deno test` 與 `jsr:@std/assert`。
 
-- **純函式單元測試**：`parseCdpAddress`（正常、前後空白、缺 port、port 非數字或超出範圍、host 為空或含 `/`）、`browserWsUrl`（回傳 `ws://host:port/devtools/browser`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
+- **純函式單元測試**：`parseCdpAddress`（正常、前後空白、缺 port、port 非數字或超出範圍、host 為空或含 `/`）、`browserWsUrl`（回傳 `ws://host:port/devtools/browser`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、`splitStderr`（`\r` 分隔的段標為 transient、`\n` 結尾的段不是、`\r\n` 視為一個換行、跨 chunk 截斷的段正確接回、空段與前後空白被略過）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
 - **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、頁面身分檢查（假 server 依送來的 wrapper 運算式回傳「網址不符」的 `exceptionDetails` 時，`extractFromTab` 以該訊息失敗；並以純函式單元測試驗證 wrapper 產生器把 `URL_PATTERN` 的 source/flags 正確嵌入且去除 `g`/`y`；另在測試中以 Deno 直接 `eval` 產生的 wrapper 檢查片段，對符合與不符合的 `location.href` 樣本驗證行為）、存活檢查（假 server 對所有 evaluate 都不回應時：不送出使用者腳本，且從 `extractFromTab` 呼叫到 reject 的總耗時小於 7 秒——3 秒存活檢查 + 最多 3 秒 detach）、使用者腳本請求懸置中假 server 發出 `Target.detachedFromTarget` 時，`extractFromTab` 在 1 秒內以分頁已關閉的錯誤結束、client 對該 session 的 pending 請求以 `CdpSessionClosedError` reject，以及每次擷取使用不同 token、讀取運算式只讀該 token 的資料、`finally` 只送 `Target.detachFromTarget` 而不送任何頁面端運算式。另以 Deno 直接 `eval` 實際產生的 wrapper（以一個模擬 `window` 的全新空物件作為 `globalThis.window`）驗證：在全新頁面上不會因 `window.__ffdl` 不存在而丟錯；連續兩次擷取分別存入各自的 token、互不覆寫。
-- **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
+- **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、以 `-re` 實速執行時至少收到一次以 `frame=` 開頭的 `message` 且 `stderrTail` 中沒有 transient 的狀態行、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、目的地失敗（`outputDir` 指向一個無法建立的路徑，例如其上層是一般檔案；檔名超過 255 位元組導致存在檢查丟出非 NotFound 錯誤；發佈時目標資料夾已被移除寫入權限）時狀態回到 ready 並帶 `lastError`、main/aux 保留、`<tempDir>/out/` 已刪除，之後把 `outputDir` 改成可寫入的資料夾再呼叫 `startProcess` 能成功完成、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
 - **連線管理**：以延遲回應 WebSocket upgrade 的假 CDP server 模擬「等待授權」：重疊呼叫兩次 `connect()` 時 server 只收到一次連線；連線等待中呼叫 `shutdown()`，連線完成後立即被關閉、`connect()` 以「程式正在結束」失敗；舊 client 關閉後才觸發的 `closed` 處理函式不會把新連線標成中斷。
