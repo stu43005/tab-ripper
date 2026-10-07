@@ -6125,6 +6125,7 @@ const ui = {
   polling: false,
   refreshQueued: false,
   startPending: false,
+  probeGeneration: 0,
   probeTimer: null,
   resultPath: null,
 };
@@ -6279,6 +6280,8 @@ function startProbing() {
 }
 
 function stopProbing() {
+  // Invalidate any in-flight probe so an obsolete result cannot overwrite a newer one.
+  ui.probeGeneration++;
   if (ui.probeTimer !== null) {
     clearTimeout(ui.probeTimer);
     ui.probeTimer = null;
@@ -6288,8 +6291,15 @@ function stopProbing() {
 async function probeOnce() {
   ui.probeTimer = null;
   if (ui.screen !== "connect" || ui.shuttingDown) return;
+  const generation = ui.probeGeneration;
   try {
     const result = await bindings.probe();
+    if (generation !== ui.probeGeneration) return;
+    if (ui.settings && result.address !== ui.settings.cdpAddress) {
+      // Settings changed while probing: probe the current address instead.
+      startProbing();
+      return;
+    }
     setText("probe-address", result.address);
     setText("probe-address-open", result.address);
     setHidden("connect-closed", result.open);
@@ -6298,6 +6308,7 @@ async function probeOnce() {
       ui.probeTimer = setTimeout(() => void probeOnce(), PROBE_MS);
     }
   } catch (error) {
+    if (generation !== ui.probeGeneration) return;
     showError("connect-error", error);
     ui.probeTimer = setTimeout(() => void probeOnce(), PROBE_MS);
   }
@@ -6753,7 +6764,12 @@ win.bind("saveSettings", async (next: Settings) => {
   return { tools: await checkTools(candidate), persistError };
 });
 
-win.bind("probe", async () => ({ open: await probeCdpPort(settings.cdpAddress), address: settings.cdpAddress }));
+win.bind("probe", async () => {
+  // Read the address once: the result must describe the address actually probed,
+  // even if settings change while the probe is in flight.
+  const address = settings.cdpAddress;
+  return { open: await probeCdpPort(address), address };
+});
 win.bind("connect", () => run(() => job.connect()));
 win.bind("getConnection", () => run(() => ({ connected: job.isConnected() })));
 win.bind("listTabs", () => run(() => job.listTabs()));
@@ -6946,7 +6962,7 @@ Then run `deno task build`.
 
 - [ ] **Step 2: Walk the user through spec §9 manual checklist** with `open dist/TabRipper.app`, recording PASS/FAIL for each:
   1. Remote debugging toggle OFF in Brave → connect screen shows the `chrome://inspect/#remote-debugging` guidance; turning it ON switches to "偵測到" within 2 s and Brave shows **no** permission dialog.
-  2. Still on the connect screen (not yet connected): set 設定 › CDP 位址 to `127.0.0.1:9223` → the probe shows not detected; set it back to `127.0.0.1:9222` → detected again. Then click 連線 → exactly one Brave permission dialog; after Allow the tab list appears.
+  2. Still on the connect screen (not yet connected): set 設定 › CDP 位址 to `127.0.0.1:9223` → the probe shows not detected and the displayed probe address is `127.0.0.1:9223`; set it back to `127.0.0.1:9222` → detected again and the displayed address is `127.0.0.1:9222` (the screen never shows one address with another address's result). Then click 連線 → exactly one Brave permission dialog; after Allow the tab list appears.
   3. Finish one job, click 再一次 → no new permission dialog.
   4. Start an extraction and close that tab within the script's 5-second delay → "分頁已關閉或已中斷偵錯連線".
   5. Pick a never-opened (dormant) tab → about 3 s later "分頁尚未載入"; open that tab in Brave and retry → success.
@@ -6962,7 +6978,7 @@ Then run `deno task build`.
 
 - [ ] **Step 3: Record results** — report each item's PASS/FAIL with observations to the user. Any FAIL is handled with root-cause analysis before changing code (project rules), then the affected task's tests are extended first.
 
-- [ ] **Step 4: Restore the user files** — with the `BACKUP` path recorded in Step 1, copy back exactly the four backed-up files: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cp "$BACKUP/$f" "user/$f"; done`. Verify each one: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cmp "$BACKUP/$f" "user/$f"; done` prints nothing (other files the user may keep in `user/` were never touched). Only then remove the backup with `rm -r "$BACKUP"`.
+- [ ] **Step 4: Restore the user files** — first make sure no acceptance build is running (quit it with Cmd+Q; `pgrep -fl TabRipper` prints nothing). Then, with the `BACKUP` path recorded in Step 1, copy back exactly the four backed-up files: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cp "$BACKUP/$f" "user/$f"; done`. Verify each one: `for f in config.ts page-script.js info.ts ffmpeg-args.ts; do cmp "$BACKUP/$f" "user/$f"; done` prints nothing (other files the user may keep in `user/` were never touched). Only then remove the backup with `rm -r "$BACKUP"`.
 
 - [ ] **Step 5: Final gate** — the automated suite assumes the committed default `user/` files (example.com pattern, `Clip.mp4` default name, duration probing on). Run it against those defaults even if the restored `user/` tree is customised:
   1. Record the stash count: `git stash list | wc -l` → `N_BEFORE`.
