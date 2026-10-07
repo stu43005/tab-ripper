@@ -5453,12 +5453,15 @@ Deno.test({
     const hang = await makeExecutable(toolDir, "hang", "exec sleep 30");
     const markerPath = join(toolDir, "ffmpeg-ran");
     const marker = await makeExecutable(toolDir, "marker", `touch "${markerPath}"\nexit 1`);
+    const before = await sessionTempDirs();
     const f = await readyJob({ main: VIDEO }, { ffprobePath: hang, ffmpegPath: marker });
     try {
+      const [tempDir] = await newSessionTempDirs(before);
       await f.job.startProcess("p.mp4", null);
       await waitFor(() => activeChildCount() === 1, "ffprobe running");
       await f.job.shutdown();
       assertEquals(f.job.getStatus(), { state: "cancelled" });
+      assertEquals(await pathExists(tempDir), false);
       assertEquals(await pathExists(markerPath), false);
       assertEquals(await listDir(f.outputDir), []);
       assertEquals(activeChildCount(), 0);
