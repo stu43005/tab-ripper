@@ -310,7 +310,7 @@ type JobStatus =
 7. 結束後依序判斷：已要求取消 → cancelled；結束碼非 0 → failed(process)，`detail` 為 stderr 最後 20 行；結束碼 0 但輸出檔不存在 → failed(process,「ffmpeg 未產生輸出檔，請檢查 buildFfmpegArgs 是否寫入 outputPath」)。
 8. 結束碼 0 且輸出檔存在 → phase=publishing，以 `src/publish.ts` 的 `publishOutput(tempOutput, finalPath)` **發佈**到 `<outputDir>/<filename>`：
    - 先嘗試 `Deno.rename(tempOutput, finalPath)`（同一磁碟時為原子操作）。
-   - 若因跨裝置失敗：先 `copyFile` 到輸出資料夾內的暫存名稱 `<outputDir>/.<filename>.ffdl-<隨機>.part`，確認大小與來源一致後，再以同資料夾內的 `Deno.rename` 換成 `finalPath`（原子操作）。複製或確認失敗時刪除 `.part` 檔、保留既有的 `finalPath` 不動。
+   - 若因跨裝置失敗：先 `copyFile` 到輸出資料夾內的暫存名稱 `<outputDir>/.ffdl-<crypto.randomUUID()>.part`（固定長度、與最終檔名無關，避免接近 255 位元組上限的合法檔名因加上後綴而超長），確認大小與來源一致後，再以同資料夾內的 `Deno.rename` 換成 `finalPath`（原子操作）。複製或確認失敗時刪除 `.part` 檔、保留既有的 `finalPath` 不動。
    - 任何發佈失敗（rename 或複製失敗：磁碟已滿、資料夾消失、無寫入權限等）→ **目的地失敗**（見步驟 9），訊息附系統錯誤。
    - 成功 → done。
 9. **清理邊界**：步驟 2–8 全部包在同一個錯誤與取消邊界內。有兩種**保留擷取檔**的非終止出口（以旗標標記，`finally` 看到旗標就只做部分清理）：
@@ -322,7 +322,7 @@ type JobStatus =
 
 - App 啟動時（上次異常結束的殘留）：
   - 刪除系統暫存目錄下所有 `ffdl-` 開頭的目錄；系統暫存目錄以「建立一個新暫存目錄、取其上層、再刪掉它」的方式取得。
-  - 刪除目前 `outputDir` 中符合 `.*.ffdl-*.part` 的檔案（中斷的跨裝置發佈殘檔）。
+  - 刪除目前 `outputDir` 中符合 `.ffdl-*.part` 的檔案（中斷的跨裝置發佈殘檔）。
 - 正常結束時的收尾見 §6.11。
 
 CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
@@ -458,10 +458,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、目的地失敗（`outputDir` 指向一個無法建立的路徑，例如其上層是一般檔案；檔名超過 255 位元組導致存在檢查丟出非 NotFound 錯誤；發佈時目標資料夾已被移除寫入權限）時狀態回到 ready 並帶 `lastError`、main/aux 保留、`<tempDir>/out/` 已刪除，之後把 `outputDir` 改成可寫入的資料夾再呼叫 `startProcess` 能成功完成、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
 - **連線管理**：以延遲回應 WebSocket upgrade 的假 CDP server 模擬「等待授權」：重疊呼叫兩次 `connect()` 時 server 只收到一次連線；連線等待中呼叫 `shutdown()`，連線完成後立即被關閉、`connect()` 以「程式正在結束」失敗；舊 client 關閉後才觸發的 `closed` 處理函式不會把新連線標成中斷。
-- **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.x.mp4.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
+- **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
 - **工具檢查逾時**：以 `-version` 永不結束的假執行檔腳本呼叫 `checkTool`（縮短 `timeoutMs`），驗證回傳 `ok: false`、子行程已結束且已從登記集合移除；`killAllChildren()` 能終止登記中的懸置子行程。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
-- **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
+- **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；最終檔名長度為 250 位元組（接近上限的合法檔名）時同樣成功；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真實瀏覽器無法自動化；以 Brave 執行）：
   1. 瀏覽器未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且瀏覽器**未**跳出授權對話框。
   2. 按連線 → 瀏覽器跳出授權對話框一次；允許後看到分頁清單。設定中 `browserUserDataDir` 留空即可自動找到 Brave。
