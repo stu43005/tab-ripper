@@ -371,6 +371,11 @@ Deno.test("parseCdpAddress rejects malformed addresses", () => {
       "ws://127.0.0.1:9222",
       "a b:9222",
       "host/path:9222",
+      "localhost?x:9222",
+      "local#host:9222",
+      "user@host:9222",
+      "[::1]:9222",
+      "back\\slash:9222",
     ]
   ) {
     assertThrows(() => parseCdpAddress(bad), Error, FORMAT_ERROR, `should reject ${JSON.stringify(bad)}`);
@@ -416,7 +421,9 @@ export function parseCdpAddress(address: string): { host: string; port: number }
   if (colon <= 0) throw new Error(FORMAT_ERROR);
   const host = trimmed.slice(0, colon);
   const portText = trimmed.slice(colon + 1);
-  if (/[\s/]/.test(host) || host.includes(":")) throw new Error(FORMAT_ERROR);
+  // URL delimiters in the host would make the WebSocket URL target a
+  // different endpoint than the TCP probe.
+  if (/[\s/?#@[\]\\:]/.test(host)) throw new Error(FORMAT_ERROR);
   if (!/^\d+$/.test(portText)) throw new Error(FORMAT_ERROR);
   const port = Number(portText);
   if (port < 1 || port > 65535) throw new Error(FORMAT_ERROR);
@@ -1132,6 +1139,8 @@ Expected: `ok | 13 passed | 0 failed`.
 - Create: `tests/helpers/fixtures.ts`
 - Modify: `src/ffmpeg.ts` (append process management below the parsers)
 - Test: `tests/ffmpeg_process_test.ts`
+
+**Scope note — process trees:** timeouts, cancellation and `killAllChildren()` act on the directly spawned process. A configured wrapper script that starts the real tool *without* `exec` can leave a descendant holding stdout/stderr open, delaying EOF. The user adjudicated this as an accepted limitation (spec §10 "wrapper script 的子孫行程"): tool paths must point at the executables or at `exec`-style wrappers, which is why every fake executable in these tests uses `exec`. No process-group handling or stream-read timeout is implemented.
 
 - [ ] **Step 1: Create shared test fixtures** — `tests/helpers/fixtures.ts`
 
@@ -3077,6 +3086,8 @@ export interface FakePageOptions {
   detachAfterLastRead?: boolean;
   /** Close the socket right after answering the last chunk read. */
   closeAfterLastRead?: boolean;
+  /** Close the socket instead of answering Target.detachFromTarget. */
+  closeOnDetach?: boolean;
 }
 
 export interface FakePage {
@@ -3109,6 +3120,10 @@ export function fakePage(options: FakePageOptions = {}): FakePage {
         reply(connection, request, { sessionId: `session-${String(request.params.targetId)}-${attachCount}` });
         return;
       case "Target.detachFromTarget":
+        if (options.closeOnDetach) {
+          connection.close();
+          return;
+        }
         reply(connection, request, {});
         connection.send({ method: "Target.detachedFromTarget", params: { sessionId: request.params.sessionId } });
         return;
@@ -3310,6 +3325,23 @@ Deno.test({
 });
 
 Deno.test({
+  name: "extractFromTab fails when the connection drops while detaching",
+  ...opts,
+  fn: async () => {
+    const h = await harness({ closeOnDetach: true });
+    try {
+      await assertRejects(
+        () => extractFromTab(h.client, "T1", h.dir, () => {}),
+        ExtractError,
+        "與瀏覽器的連線已中斷",
+      );
+    } finally {
+      await h.dispose();
+    }
+  },
+});
+
+Deno.test({
   name: "extractFromTab reports a changed page URL",
   ...opts,
   fn: async () => {
@@ -3459,7 +3491,7 @@ export function extractFromTab(
 - [ ] **Step 4: Run test to verify it fails**
 
 Run: `deno task test tests/extract_test.ts`
-Expected: 11 tests FAIL — the success test with `not implemented`, the others because the rejection is an `Error`, not an `ExtractError` with the expected message.
+Expected: 12 tests FAIL — the success test with `not implemented`, the others because the rejection is an `Error`, not an `ExtractError` with the expected message.
 
 - [ ] **Step 5: Implement** — replace the `src/extract.ts` import block with:
 
@@ -3563,6 +3595,7 @@ export async function extractFromTab(
   void client.closed.then(() => {
     connectionLost = true;
   });
+  let result!: ExtractResult;
   try {
     try {
       await evaluate(client, sessionId, "1", LIVENESS_TIMEOUT_MS);
@@ -3622,7 +3655,7 @@ export async function extractFromTab(
     // An interruption during the final local writes must still fail the job.
     if (detached) throw new ExtractError("分頁已關閉或已中斷偵錯連線");
     if (connectionLost) throw new ExtractError("與瀏覽器的連線已中斷");
-    return { info: head.info, mainPath, auxPath, mainSize: head.sizes.main, auxSize: head.sizes.aux };
+    result = { info: head.info, mainPath, auxPath, mainSize: head.sizes.main, auxSize: head.sizes.aux };
   } catch (error) {
     throw toExtractError(error, detached);
   } finally {
@@ -3630,16 +3663,21 @@ export async function extractFromTab(
     // No page-side cleanup by design; only detach, bounded to 3 s.
     if (!detached) {
       await client.send("Target.detachFromTarget", { sessionId }, undefined, { timeoutMs: DETACH_TIMEOUT_MS })
-        .catch(() => {});
+        .catch((error) => {
+          if (error instanceof CdpClosedError) connectionLost = true;
+        });
     }
   }
+  // Re-checked after the detach await: a disconnect during it still fails.
+  if (connectionLost) throw new ExtractError("與瀏覽器的連線已中斷");
+  return result;
 }
 ```
 
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `deno task test tests/extract_test.ts tests/extract_expressions_test.ts`
-Expected: `ok | 20 passed | 0 failed`.
+Expected: `ok | 21 passed | 0 failed`.
 
 - [ ] **Step 7: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -4316,6 +4354,7 @@ import { isAbsolute, join } from "@std/path";
 import { activeChildCount } from "../src/ffmpeg.ts";
 import { BUSY_MESSAGE } from "../src/job.ts";
 import type { Settings } from "../src/types.ts";
+import { URL_PATTERN } from "../user/config.ts";
 import {
   FFMPEG,
   listDir,
@@ -4421,6 +4460,7 @@ Deno.test({
       assertEquals(first, { needsConfirm: true, finalPath });
       assertEquals(f.job.getStatus().state, "ready");
       assert(await pathExists(join(tempDir, "main.bin")));
+      assert(await pathExists(join(tempDir, "aux.bin")));
       const second = await f.job.startProcess("out.mp4", first.finalPath);
       assertEquals(second, { needsConfirm: false, finalPath });
       await waitForState(f.job, ["done"]);
@@ -4507,6 +4547,7 @@ Deno.test({
       assertStringIncludes(status.lastError ?? "", "輸出失敗：");
       assertEquals(status.defaultFilename, "a.mp4");
       assert(await pathExists(join(tempDir, "main.bin")));
+      assert(await pathExists(join(tempDir, "aux.bin")));
       assertEquals(await pathExists(join(tempDir, "out")), false);
       f.job.updateSettings(f.settings);
       await f.job.startProcess("a.mp4", null);
@@ -4529,6 +4570,7 @@ Deno.test({
       assert(status.state === "ready");
       assertStringIncludes(status.lastError ?? "", "輸出失敗：");
       assert(await pathExists(join(tempDir, "main.bin")));
+      assert(await pathExists(join(tempDir, "aux.bin")));
     } finally {
       f.job.discard();
       await f.dispose();
@@ -4549,6 +4591,7 @@ Deno.test({
       assert(status.state === "ready", JSON.stringify(status));
       assertStringIncludes(status.lastError ?? "", "輸出失敗：");
       assert(await pathExists(join(tempDir, "main.bin")));
+      assert(await pathExists(join(tempDir, "aux.bin")));
       assertEquals(await pathExists(join(tempDir, "out")), false);
       await Deno.chmod(f.outputDir, 0o755);
       await f.job.startProcess("pub.mp4", null);
@@ -4710,6 +4753,60 @@ Deno.test({
 });
 
 Deno.test({
+  name: "a cancel issued right after startProcess with an unusable destination cancels and cleans up",
+  ...base,
+  fn: async () => {
+    const { f, tempDir } = await videoJob();
+    try {
+      const blocker = join(f.workDir, "blocker");
+      await Deno.writeTextFile(blocker, "not a directory");
+      f.job.updateSettings({ ...f.settings, outputDir: join(blocker, "sub") });
+      const pending = f.job.startProcess("x.mp4", null);
+      f.job.cancel(); // Still processing/preparing: accepted before the destination check fails.
+      await pending;
+      assertEquals(f.job.getStatus(), { state: "cancelled" });
+      assertEquals(await pathExists(tempDir), false);
+    } finally {
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "a failed duration probe sets probeWarning and processing still completes",
+  ...base,
+  fn: async () => {
+    const tools = await fakeTools();
+    const { f } = await videoJob({ ffprobePath: tools.failing });
+    try {
+      assertEquals(f.job.probeWarning, null);
+      await f.job.startProcess("np.mp4", null);
+      assertEquals(await waitForState(f.job, ["done", "failed"]), {
+        state: "done",
+        outputPath: join(f.outputDir, "np.mp4"),
+      });
+      assertStringIncludes(f.job.probeWarning ?? "", "無法以 ffprobe 取得長度");
+    } finally {
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "urlPattern exposes the configured pattern as text",
+  ...base,
+  fn: async () => {
+    const { f } = await videoJob();
+    try {
+      assertEquals(f.job.urlPattern, String(URL_PATTERN));
+    } finally {
+      f.job.discard();
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
   name: "a relative outputDir is resolved to an absolute path at startProcess",
   ...base,
   fn: async () => {
@@ -4735,6 +4832,14 @@ Deno.test({
 - [ ] **Step 2: Add the skeleton** — in `src/job.ts`, add inside the class (after `reset`)
 
 ```ts
+  get probeWarning(): string | null {
+    return null;
+  }
+
+  get urlPattern(): string {
+    return "";
+  }
+
   startProcess(
     _filename: string,
     _confirmedOverwritePath: string | null,
@@ -4750,7 +4855,7 @@ Deno.test({
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: 17 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`).
+Expected: 20 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`), and the `urlPattern` test fails because the skeleton getter returns `""`.
 
 - [ ] **Step 4: Implement** — in `src/job.ts`:
 
@@ -4803,6 +4908,22 @@ Add these fields after `#work`:
   #cancelRequested = false;
   #abort: AbortController | null = null;
   #run: FfmpegRun | null = null;
+  /** Set when the last duration probe failed; shown on the settings page. */
+  #probeWarning: string | null = null;
+```
+
+Delete the two skeleton getters (`probeWarning`, `urlPattern`) and add these next to `isShuttingDown`:
+
+```ts
+  /** Warning from the most recent failed ffprobe duration probe, if any. */
+  get probeWarning(): string | null {
+    return this.#probeWarning;
+  }
+
+  /** The URL pattern as text, for the tab list's empty state. */
+  get urlPattern(): string {
+    return String(URL_PATTERN);
+  }
 ```
 
 Replace the two skeleton methods with:
@@ -4896,6 +5017,11 @@ Replace the two skeleton methods with:
         ? await probeDuration(ctx.settings.ffprobePath, ctx.extracted.mainPath, ctx.abort.signal)
         : null;
       if (this.#cancelRequested) return;
+      // The duration probe is authoritative for the progress mode; a failure
+      // is surfaced as a settings warning and processing continues.
+      if (PROBE_DURATION) {
+        this.#probeWarning = durationSec === null ? "無法以 ffprobe 取得長度，進度改為不確定顯示；請檢查 ffprobe 路徑" : null;
+      }
       await Deno.mkdir(outDir, { recursive: true });
       if (this.#cancelRequested) return;
 
@@ -4966,6 +5092,14 @@ Replace the two skeleton methods with:
     } finally {
       this.#run = null;
       this.#abort = null;
+      if (cleanup === "keep-inputs") {
+        await Deno.remove(outDir, { recursive: true }).catch(() => {});
+        // A cancel accepted during that await wins: clean everything up.
+        if (this.#cancelRequested) {
+          cleanup = "remove-all";
+          next = { state: "cancelled" };
+        }
+      }
       if (cleanup === "remove-all") {
         const warning = await this.#removeTempDir(ctx.tempDir);
         this.#tempDir = null;
@@ -4974,8 +5108,6 @@ Replace the two skeleton methods with:
         if (warning && (next.state === "done" || next.state === "failed" || next.state === "cancelled")) {
           next = { ...next, cleanupWarning: warning };
         }
-      } else if (cleanup === "keep-inputs") {
-        await Deno.remove(outDir, { recursive: true }).catch(() => {});
       }
       // Status first, then release startProcess: callers never see a stale state.
       this.#status = next;
@@ -4987,7 +5119,7 @@ Replace the two skeleton methods with:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: `ok | 17 passed | 0 failed`.
+Expected: `ok | 20 passed | 0 failed`.
 
 - [ ] **Step 6: Run the whole suite** — `deno task test` → all tests pass.
 
@@ -5355,7 +5487,7 @@ and remove the now-unused `import { killAllChildren } from "../../src/ffmpeg.ts"
 - Create: `src/ui-assets.ts`
 - Test: `tests/ui_assets_test.ts`
 
-The UI is plain JS run by WKWebView; it talks to the backend only through the `bindings` global (spec §6.10, §6.12). `getSettings` additionally returns `urlPattern` (the string form of `URL_PATTERN`) so the tab list can show it in its empty state (spec §6.12 item 2).
+The UI is plain JS run by WKWebView; it talks to the backend only through the `bindings` global (spec §6.10, §6.12). `getSettings` additionally returns `urlPattern` (from `JobManager.urlPattern`, keeping `user/` imports inside the modules the spec §4 allows) so the tab list can show it in its empty state (spec §6.12 item 2), and `probeWarning` (from `JobManager.probeWarning`) so a failed duration probe is shown on the settings page (spec §8).
 
 - [ ] **Step 1: Write the failing test** — `tests/ui_assets_test.ts`
 
@@ -5538,6 +5670,7 @@ Expected: 4 tests FAIL — content type is `text/plain;charset=UTF-8`, the unkno
         <p id="tool-ffmpeg" class="muted"></p>
         <label class="field">ffprobe 路徑 <input name="ffprobePath" type="text" spellcheck="false"></label>
         <p id="tool-ffprobe" class="muted"></p>
+        <p id="probe-warning" class="warning" hidden></p>
         <p id="settings-error" class="error" hidden></p>
         <div class="actions">
           <button id="settings-close" type="button">關閉</button>
@@ -5766,6 +5899,7 @@ const ui = {
   urlPattern: "",
   pollTimer: null,
   polling: false,
+  refreshQueued: false,
   probeTimer: null,
   resultPath: null,
 };
@@ -5842,7 +5976,13 @@ function stopPolling() {
 }
 
 async function refresh() {
-  if (ui.shuttingDown || ui.polling) return;
+  if (ui.shuttingDown) return;
+  if (ui.polling) {
+    // A refresh requested mid-flight must not be dropped: the in-flight one
+    // may hold a stale snapshot taken before the caller's action.
+    ui.refreshQueued = true;
+    return;
+  }
   ui.polling = true;
   try {
     const [status, connection] = await Promise.all([bindings.getStatus(), bindings.getConnection()]);
@@ -5854,6 +5994,10 @@ async function refresh() {
     console.error(error);
   } finally {
     ui.polling = false;
+  }
+  if (ui.refreshQueued && !ui.shuttingDown) {
+    ui.refreshQueued = false;
+    await refresh();
   }
 }
 
@@ -6161,6 +6305,8 @@ async function loadSettings() {
   ui.urlPattern = data.urlPattern;
   setHidden("settings-warning", !data.warning);
   setText("settings-warning", data.warning ?? "");
+  setHidden("probe-warning", !data.probeWarning);
+  setText("probe-warning", data.probeWarning ?? "");
   renderTools();
 }
 
@@ -6173,7 +6319,14 @@ function renderTools() {
   $("tool-ffprobe").className = ui.tools.ffprobe.ok ? "muted" : "warning";
 }
 
-function openSettings() {
+async function openSettings() {
+  // Reload so tool checks and the latest ffprobe warning are current.
+  try {
+    await loadSettings();
+  } catch (error) {
+    console.error(error);
+  }
+  if (ui.shuttingDown) return;
   const form = $("settings-form");
   for (const key of SETTING_KEYS) form.elements.namedItem(key).value = ui.settings ? ui.settings[key] : "";
   showError("settings-error", null);
@@ -6197,7 +6350,9 @@ async function saveSettingsFromForm() {
     return;
   }
   if (ui.screen === "connect") startProbing();
-  if (ui.screen === "preview") await refresh();
+  // Reconcile with the backend after any settings change (e.g. a dropped
+  // connection while the dialog was open, or ffmpeg becoming usable).
+  await refresh();
 }
 
 // ---- shutdown overlay (called by the backend via executeJs) ----
@@ -6215,7 +6370,7 @@ globalThis.__showShuttingDown = () => {
 // ---- wiring ----
 
 function wire() {
-  $("open-settings").addEventListener("click", openSettings);
+  $("open-settings").addEventListener("click", () => void openSettings());
   $("settings-close").addEventListener("click", () => $("settings-dialog").close());
   $("settings-save").addEventListener("click", () => void saveSettingsFromForm());
   $("probe-retry").addEventListener("click", () => startProbing());
@@ -6280,12 +6435,11 @@ Expected: `ok | 4 passed | 0 failed`.
 // Tab Ripper desktop entry: window, menu, bindings, close handling, UI server.
 import { cleanupStaleArtifacts, systemTempRoot } from "./src/cleanup.ts";
 import { probeCdpPort } from "./src/cdp/probe.ts";
-import { checkTool } from "./src/ffmpeg.ts";
+import { checkTool, killAllChildren } from "./src/ffmpeg.ts";
 import { JobManager, SHUTTING_DOWN_MESSAGE } from "./src/job.ts";
 import { loadSettings, saveSettings } from "./src/settings.ts";
 import type { Settings, ToolCheck } from "./src/types.ts";
 import { serveUi } from "./src/ui-assets.ts";
-import { URL_PATTERN } from "./user/config.ts";
 
 const loaded = await loadSettings();
 let settings: Settings = loaded.settings;
@@ -6303,6 +6457,12 @@ function run<T>(fn: () => T | Promise<T>): Promise<T> {
 }
 
 async function checkTools(current: Settings): Promise<{ ffmpeg: ToolCheck; ffprobe: ToolCheck }> {
+  // No new child processes once shutdown has started: they could outlive
+  // the final killAllChildren() before Deno.exit().
+  if (job.isShuttingDown) {
+    const skipped: ToolCheck = { ok: false, error: SHUTTING_DOWN_MESSAGE };
+    return { ffmpeg: skipped, ffprobe: skipped };
+  }
   const [ffmpeg, ffprobe] = await Promise.all([checkTool(current.ffmpegPath), checkTool(current.ffprobePath)]);
   return { ffmpeg, ffprobe };
 }
@@ -6311,7 +6471,8 @@ win.bind("getSettings", async () => ({
   settings,
   warning: loaded.warning ?? null,
   tools: await checkTools(settings),
-  urlPattern: String(URL_PATTERN),
+  urlPattern: job.urlPattern,
+  probeWarning: job.probeWarning,
 }));
 
 win.bind("saveSettings", async (next: Settings) => {
@@ -6395,6 +6556,8 @@ async function requestShutdown(): Promise<void> {
   clearTimeout(overlayTimer);
   await shutdown;
   shutdownDone = true;
+  // No await between this kill and exit: nothing can spawn in between.
+  killAllChildren();
   win.close();
   Deno.exit(0);
 }
@@ -6444,7 +6607,7 @@ Expected: ends with `Bundle dist/TabRipper.app`; `ls -d dist/TabRipper.app` prin
 
 The automated suite cannot drive the desktop window or the real browser (spec §9 manual list). The user performs the UI actions; the implementer runs commands, reads logs and records results.
 
-- [ ] **Step 1: Back up and install the temporary acceptance configuration** — first back up the current files (they may contain the user's own work): `mkdir -p "$TMPDIR/tab-ripper-user-backup" && cp user/config.ts user/page-script.js user/info.ts user/ffmpeg-args.ts "$TMPDIR/tab-ripper-user-backup/"`. Then overwrite these files (restored in Step 4):
+- [ ] **Step 1: Back up and install the temporary acceptance configuration** — first back up the current files (they may contain the user's own work) into a fresh, uniquely named directory: run `mktemp -d "$TMPDIR/tab-ripper-user-backup.XXXXXX"`, record the printed path as `BACKUP` (it is needed in Step 4 and in any restarted session), then `cp user/config.ts user/page-script.js user/info.ts user/ffmpeg-args.ts "$BACKUP"/`. If acceptance is ever restarted, reuse the recorded `BACKUP` and **skip this backup** — never back up the acceptance fixtures over it. Then overwrite these files (restored in Step 4):
 
 `user/config.ts`:
 
@@ -6534,6 +6697,6 @@ Then run `deno task build`.
 
 - [ ] **Step 3: Record results** — report each item's PASS/FAIL with observations to the user. Any FAIL is handled with root-cause analysis before changing code (project rules), then the affected task's tests are extended first.
 
-- [ ] **Step 4: Restore the user files** — `cp "$TMPDIR"/tab-ripper-user-backup/* user/`, then `diff -r "$TMPDIR/tab-ripper-user-backup" user/` prints nothing; remove the backup with `rm -r "$TMPDIR/tab-ripper-user-backup"`.
+- [ ] **Step 4: Restore the user files** — with the `BACKUP` path recorded in Step 1: `cp "$BACKUP"/* user/`, then `diff -r "$BACKUP" user/` prints nothing; only then remove the backup with `rm -r "$BACKUP"`.
 
 - [ ] **Step 5: Final gate** — `deno task check && deno task lint && deno fmt --check && deno task test && deno task build` all succeed on the restored tree.
