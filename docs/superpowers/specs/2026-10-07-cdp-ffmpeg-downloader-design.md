@@ -2,11 +2,11 @@
 
 - 日期：2026-10-07
 - 狀態：設計已與使用者確認，待 spec review
-- 執行環境：Deno 2.9.7（`deno desktop`）、macOS（arm64）、Google Chrome 154、ffmpeg 8.0
+- 執行環境：Deno 2.9.7（`deno desktop`）、macOS（arm64）、Chromium 系瀏覽器（使用者實際使用 Brave 154.1.96.59；Chrome 154 同樣支援）、ffmpeg 8.0
 
 ## 1. 目的
 
-一支以 `deno desktop` 打包的桌面程式，透過 Chrome DevTools Protocol（CDP）連上使用者**正在使用的** Chrome，讓使用者從符合指定網址規則的分頁中挑一個，在該分頁內執行使用者自寫的 JS 腳本，取回兩個檔案（ArrayBuffer）與一組資訊；資訊以表格呈現並讓使用者確認輸出檔名，接著用 ffmpeg 處理主檔並顯示進度，成品輸出到指定資料夾。
+一支以 `deno desktop` 打包的桌面程式，透過 Chrome DevTools Protocol（CDP）連上使用者**正在使用的** Chromium 系瀏覽器（Brave、Chrome 等，下文統稱「瀏覽器」），讓使用者從符合指定網址規則的分頁中挑一個，在該分頁內執行使用者自寫的 JS 腳本，取回兩個檔案（ArrayBuffer）與一組資訊；資訊以表格呈現並讓使用者確認輸出檔名，接著用 ffmpeg 處理主檔並顯示進度，成品輸出到指定資料夾。
 
 網址規則、頁面腳本、資訊欄位、ffmpeg 參數**由使用者之後自行撰寫**，本專案只提供留位（`user/` 目錄）與明確的介面約定。
 
@@ -24,22 +24,34 @@
 
 以下行為已經過 research 驗證（詳見專案 MEMORY）：
 
-1. **`deno desktop`**：單一行程；UI 由入口程式的 `Deno.serve()` 提供，啟動視窗自動導向該位址；`new Deno.BrowserWindow(opts)` 首次建構時接管啟動視窗；`win.bind(name, fn)` 註冊後，頁面端以 `await bindings.name(...)` 呼叫，參數與回傳值以 JSON 編碼（允許 null/boolean/number/string/Uint8Array/純物件/陣列）。權限旗標在建置時寫入執行檔。沒有原生檔案/資料夾選擇器；`alert`/`confirm`/`prompt` 為原生對話框。預設 backend 為 OS webview（macOS：WKWebView）。
-2. **Chrome `chrome://inspect/#remote-debugging`（M144+）**：使用者在此頁開啟開關後，Chrome 會在 user data dir 根目錄寫入 `DevToolsActivePort`（第一行為 port、第二行為 path，例如 `/devtools/browser/<id>`），browser WebSocket 位址為 `ws://127.0.0.1:${port}${path}`（依 ChromeDevTools/chrome-devtools-mcp 的 `src/BrowserManager.ts`）。每次建立新的偵錯連線，Chrome 會跳出授權對話框。
+1. **`deno desktop`**：單一行程；UI 由入口程式的 `Deno.serve()` 提供，啟動視窗自動導向該位址；`new Deno.BrowserWindow(opts)` 首次建構時接管啟動視窗；`win.bind(name, fn)` 註冊後，頁面端以 `await bindings.name(...)` 呼叫，參數與回傳值以 JSON 編碼。權限旗標在建置時寫入執行檔。沒有原生檔案/資料夾選擇器；`alert`/`confirm`/`prompt` 為原生對話框。預設 backend 為 OS webview（macOS：WKWebView）。
+2. **`chrome://inspect/#remote-debugging`（Chrome M144+；Brave 同樣支援，且 Brave 也能開啟 `chrome://` 網址）**：使用者在此頁開啟開關後，瀏覽器會在 user data dir 根目錄寫入 `DevToolsActivePort`（第一行為 port、第二行為 path，例如 `/devtools/browser/<id>`），browser WebSocket 位址為 `ws://127.0.0.1:${port}${path}`（依 ChromeDevTools/chrome-devtools-mcp 的 `src/BrowserManager.ts`）。此模式下 `/json/version` 等 HTTP 探索端點回 404。每次建立新的偵錯連線，瀏覽器會跳出授權對話框。
 3. **CDP 方法**：`Target.getTargets` → `{ targetInfos: [{ targetId, type, title, url, ... }] }`；`Target.attachToTarget { targetId, flatten: true }` → `{ sessionId }`；之後的指令在訊息頂層帶 `sessionId`；`Runtime.evaluate { expression, awaitPromise: true, returnByValue: true }` 結果在 `result.value`，例外在 `exceptionDetails`；`Target.detachFromTarget { sessionId }`；分頁關閉時 browser 端會收到 `Target.detachedFromTarget { sessionId }` 事件。
 4. **Deno 2.9.7**：原生支援 `Uint8Array.fromBase64()` / `Uint8Array.prototype.toBase64()`；支援 `import x from "./a.html" with { type: "text" }`（不需 unstable 旗標），可用來把 UI 檔案編入模組圖；從 `.js` 模組匯出的函式，其 `toString()` 會回傳原始碼。
 5. **測試用套件**：`jsr:@std/assert@1.0.19`（`assertEquals`、`assertThrows`、`assertRejects`）、`jsr:@std/path@1.1.6`（`join`、`dirname`、`basename`）。
 
-### 3.1 尚待實作時實測的假設
+### 3.1 實機驗證結果（2026-10-07，Brave 154 + Deno 2.9.7）
 
-以下假設無法僅靠文件確認，**實作第一個任務必須實際開啟 Chrome 開關做驗證**；任一項不成立時，回頭修改本 spec 再繼續：
+原本列為待驗證的假設已全部實測，結果如下（實驗腳本放在 session scratchpad，結論記錄於專案 MEMORY）：
 
-- A1：對 CDP 埠只做 TCP 連線（不做 WebSocket handshake）**不會**觸發 Chrome 的授權對話框。
-- A2：以 toggle 方式開啟時，CDP 埠為 `127.0.0.1:9222`，且 `DevToolsActivePort` 的 port 與之相同。
-- A3：Deno 原生 `WebSocket` 客戶端（不自訂 Origin header）可以成功連上 toggle 模式的 browser endpoint。
-- A4：`deno desktop` 預設 webview backend 下，`bindings` 與以 `with { type: "text" }` 匯入的 UI 檔案在 `--hmr` 開發模式與 `-o` 建置產物中都能正常運作。
-- A6：預設 webview backend 下，視窗 `close` 事件的 `preventDefault()` 能取消關閉，且自訂選單項目的 `CmdOrCtrl+Q` accelerator 會觸發 `menuclick`（文件已說明，但需在實機確認）。
-- A5：toggle 模式下 `Target.getTargets`、`Target.attachToTarget`（flatten）、`Runtime.evaluate` 不受限制。
+| 假設 | 結果 |
+| --- | --- |
+| A1：只做 TCP 連線不會觸發授權對話框 | ✅ 成立（使用者目視確認） |
+| A2：toggle 模式埠為 `127.0.0.1:9222`，與 `DevToolsActivePort` 一致 | ✅ 成立（Brave；瀏覽器未帶 `--remote-debugging-port` 啟動參數） |
+| A3：Deno 原生 `WebSocket`（不設 Origin）可連線 | ✅ 成立（含使用者按允許約 1.5 秒） |
+| A4：`bindings` 與 text import 的 UI 在 `--hmr` 與建置產物中正常 | ✅ 成立 |
+| A5：`getTargets` / `attachToTarget`(flatten) / `Runtime.evaluate` 可用 | ✅ 成立；頁面端有 `Uint8Array.prototype.toBase64`，4 MiB base64 往返約 415 ms |
+| A6a：視窗 `close` 事件可 `preventDefault()` | ❌ **不成立**。`e.cancelable === false`，視窗立即關閉。v2.9.7 原始碼 `cli/rt_desktop/lib.rs:223-227` 明寫 close 事件只是通知、不可取消（官方文件與實作不符） |
+| A6b：自訂選單 `CmdOrCtrl+Q` 觸發 `menuclick` 並可非同步收尾 | ✅ 成立（`executeJs` 遮罩 → 2 秒收尾 → `Deno.exit(0)`） |
+
+實測額外發現（影響設計）：
+
+- **最後一個視窗關閉時行程立即結束**，進行中的計時器與子行程等待都不會延長行程壽命；此路徑下子行程會一起被終止（以 `sleep` 觀察）。close 事件處理函式中的**同步**程式碼會執行。
+- **`Deno.exit()` 不會終止子行程**：以 Cmd+Q 路徑結束後，`sleep 123` 成為孤兒行程繼續執行。因此正常結束前必須自行終止所有子行程。
+- **休眠/尚未載入的分頁**（Brave 記憶體節省、啟動時延遲還原的分頁）仍會出現在 `getTargets` 且可以 attach，但 `Runtime.evaluate` **永遠不回應也不報錯**；使用者點開該分頁後，同一個 targetId 恢復回應（`document.wasDiscarded === true`）。
+- `deno desktop -o Name` 會產出 `Name.app`（若寫成 `-o Name.app` 會變成 `Name.app.app`）。
+- 一般的 `deno check` 不含桌面 API 型別；需在 `deno.json` 設定 `compilerOptions.lib = ["deno.desktop", "deno.unstable", "dom"]`（取自 v2.9.7 `libs/resolver/deno_json.rs`），實測可通過。
+- binding 回傳的 `Uint8Array` 到頁面端會變成普通物件（`{"0":1,...}`）；本設計的 binding 回傳值都不含二進位資料，不受影響。
 
 ## 4. 架構
 
@@ -151,7 +163,7 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 | --- | --- | --- |
 | `cdpAddress` | `127.0.0.1:9222` | CDP 主機:埠，用於 TCP 探測與組 WS URL |
 | `cdpWsUrl` | `""` | 完整 browser WS URL；非空時直接使用，忽略 `DevToolsActivePort` |
-| `chromeUserDataDir` | `$HOME/Library/Application Support/Google/Chrome` | 讀取 `DevToolsActivePort` 的位置 |
+| `browserUserDataDir` | `""`（自動偵測） | 讀取 `DevToolsActivePort` 的瀏覽器 user data dir；空字串表示依 §6.3 自動偵測 |
 | `outputDir` | `$HOME/Downloads` | 成品輸出資料夾 |
 | `ffmpegPath` | `ffmpeg` | 可為 PATH 中的名稱或絕對路徑 |
 | `ffprobePath` | `ffprobe` | 同上 |
@@ -161,7 +173,7 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 
 ### 6.2 `cdp/probe.ts`
 
-- `probeCdpPort(address: string, timeoutMs = 1000): Promise<boolean>`：以 `Deno.connect({ hostname, port })` 建立 TCP 連線，成功即立刻 `close()` 並回傳 `true`；連線被拒或逾時回傳 `false`。**不送出任何資料、不做 WebSocket handshake**（假設 A1）。
+- `probeCdpPort(address: string, timeoutMs = 1000): Promise<boolean>`：以 `Deno.connect({ hostname, port })` 建立 TCP 連線，成功即立刻 `close()` 並回傳 `true`；連線被拒或逾時回傳 `false`。**不送出任何資料、不做 WebSocket handshake**（§3.1 A1 實測：不會觸發授權對話框）。
 - `probeTarget(settings: Settings): string`：決定探測位址。`cdpWsUrl` 非空時取其 URL 的 `host:port`（無明確 port 時 `ws://` 用 80、`wss://` 用 443）；否則用 `cdpAddress`。`probe` binding 一律探測此位址，因此探測結果與 `connect()` 實際連線的目標一致。
 
 ### 6.3 `cdp/discovery.ts`
@@ -169,9 +181,12 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 - `parseDevToolsActivePort(content: string): { port: number; path: string }`：以 `\n` 分行、trim、去除空行；需同時有 port 與 path，port 為 1–65535 整數，path 以 `/` 開頭，否則丟出 `DiscoveryError`。
 - `resolveBrowserWsUrl(settings: Settings): Promise<string>`：
   1. `cdpWsUrl` 非空 → 直接回傳。
-  2. 讀取 `<chromeUserDataDir>/DevToolsActivePort`；檔案不存在 → `DiscoveryError("找不到 DevToolsActivePort，請確認已在 chrome://inspect/#remote-debugging 開啟遠端偵錯，或在設定填寫 CDP WebSocket URL")`。
-  3. 檔案中的 port 與 `cdpAddress` 的 port 不同 → `DiscoveryError`，訊息包含兩個 port，並建議修正 `cdpAddress` 或直接填寫 `cdpWsUrl`。
-  4. 回傳 `ws://${cdpAddress 的 host}:${port}${path}`。
+  2. 決定候選 user data dir：
+     - `browserUserDataDir` 非空 → 只用該路徑。
+     - 空字串（自動偵測）→ 依序使用 `$HOME/Library/Application Support/BraveSoftware/Brave-Browser`、`$HOME/Library/Application Support/Google/Chrome`（兩者路徑皆已實際確認；其他瀏覽器請在設定手動填寫）。
+  3. 依序讀取每個候選的 `DevToolsActivePort` 並解析；採用**第一個**檔案存在、解析成功且 port 等於 `cdpAddress` port 的候選。
+  4. 沒有候選可用 → `DiscoveryError`，訊息列出每個已檢查的路徑及原因（檔案不存在／格式錯誤／port 為 X 與 `cdpAddress` 的 Y 不符），並提示「請確認已在 `chrome://inspect/#remote-debugging` 開啟遠端偵錯，或在設定指定瀏覽器資料夾／填寫 CDP WebSocket URL」。
+  5. 回傳 `ws://${cdpAddress 的 host}:${port}${path}`。
 
 ### 6.4 `cdp/client.ts`
 
@@ -189,7 +204,7 @@ class CdpClient {
 - 每個請求帶遞增 `id`，回應以 `id` 對應；回應含 `error` → 以 `CdpError { code, message }` reject。
 - 無 `id` 的訊息視為事件，依 `method` 分派給 `on` 註冊的 handler（同時傳入訊息的 `sessionId`）。
 - 每個請求預設逾時 60 秒，可由 `send` 的第四個參數 `opts?: { timeoutMs?: number }` 覆寫；逾時以 `CdpTimeoutError` reject 並移除 pending（之後才到達的回應直接丟棄）。
-- 連線建立逾時（預設 10 秒，涵蓋使用者在 Chrome 授權對話框的等待）以 `CdpConnectError` reject。
+- 連線建立逾時（預設 60 秒，涵蓋使用者在瀏覽器授權對話框的等待）以 `CdpConnectError` reject。
 - socket 關閉或錯誤 → 所有 pending 以 `CdpClosedError` reject，`closed` resolve，之後的 `send` 立即 reject。
 - **整個 App 生命週期只建立一條 browser 連線**（由 `job.ts` 持有），避免重複觸發授權對話框；連線關閉後必須由使用者再次按「連線」才會重建。
 
@@ -209,6 +224,7 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 流程：
 
 1. `Target.attachToTarget { targetId, flatten: true }` 取得 `sessionId`；同時以 `client.on("Target.detachedFromTarget", ...)` 監聽，若收到相同 `sessionId` 的事件，標記中止，後續步驟以 `ExtractError("分頁已關閉或已中斷偵錯連線")` 結束。
+   - **存活檢查**：attach 後先以 `Runtime.evaluate { expression: "1", returnByValue: true }`、逾時 **3 秒**確認分頁有可執行 JS 的 renderer。逾時 → `ExtractError("分頁尚未載入（可能被瀏覽器休眠），請先在瀏覽器點開該分頁後再試一次")`，不執行使用者腳本（見 §3.1 實測：休眠分頁的 evaluate 永不回應）。
 2. 每次擷取產生唯一的 `token`（`crypto.randomUUID()`）。頁面端所有資料都放在 `window.__ffdl[token]`（`window.__ffdl` 不存在時先建立為空物件），不同擷取之間互不覆寫。
 3. 以 `Runtime.evaluate`（`awaitPromise: true, returnByValue: true`，帶 `sessionId`，逾時 **300 秒**，因為使用者腳本可能需要下載資料）執行 wrapper 運算式：
    - 以 `(${pageScript.toString()})()` 呼叫使用者腳本。
@@ -336,9 +352,11 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 ### 6.11 結束流程（shutdown）
 
-觸發來源：視窗 `close` 事件（關閉按鈕、Cmd+W）與自訂選單的「結束」（Cmd+Q）。兩者走同一個 `requestShutdown()`：
+依 §3.1 實測，Deno 2.9.7 的視窗關閉**無法攔截**，因此分成兩條路徑：
 
-1. `close` 事件中一律先呼叫 `e.preventDefault()`（`deno desktop` 支援以此取消關閉，見 MEMORY 研究結論）。若已在結束流程中，忽略重複觸發。
+**A. 優雅結束：自訂選單「結束」（Cmd+Q）**，呼叫 `requestShutdown()`：
+
+1. 若已在結束流程中，忽略重複觸發。
 2. `job.shutdown({ deadlineMs = 10000 })`：
    1. 同步設定 `shuttingDown = true`；之後所有會改變狀態的 binding（`connect`、`extract`、`startProcess`、`discard`、`reset`、`saveSettings`）一律丟出「程式正在結束」。
    2. 以 `win.executeJs("window.__showShuttingDown?.()")` 讓 UI 顯示「正在結束…」遮罩（失敗忽略）。
@@ -351,9 +369,16 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
    4. 等上述工作的 `finally`（暫存目錄清理）完成。
    5. 關閉 CDP 連線（若仍開著）。
    6. **硬性期限**：整個 shutdown 超過 `deadlineMs` 時，對仍存活的子行程同步送 SIGKILL，不再等待，直接進入下一步。此時若正在跨裝置發佈，可能留下 `.part` 殘檔，由下次啟動的清理處理（§6.9）。
-3. shutdown 完成後設定旗標，使下一次 `close` 事件不再 `preventDefault`，呼叫 `win.close()`，接著 `Deno.exit(0)`。
+   7. 最後再次確認所有子行程（ffmpeg、ffprobe）都已結束；仍存活者同步 SIGKILL。因為 `Deno.exit()` **不會**終止子行程（§3.1 實測），這一步是避免孤兒行程的唯一保障。
+3. 設定 `shutdownDone = true`，呼叫 `win.close()`，接著 `Deno.exit(0)`。
 
-無法攔截的結束方式（Dock 圖示右鍵的「結束」、強制結束、當機、斷電）不保證收尾，由啟動時的殘留清理補救（§6.9；見 §10）。
+**B. 立即結束：視窗關閉鈕、Cmd+W**。視窗與行程會立即終止，無法等待任何非同步工作。`close` 事件處理函式只做**同步、盡力而為**的收尾（`shutdownDone` 為 true 時直接略過）：
+
+1. 對仍存活的 ffmpeg / ffprobe 子行程同步呼叫 `kill("SIGKILL")`（實測此路徑子行程也會被一起終止，這是額外保險）。
+2. 以 `Deno.removeSync(tempDir, { recursive: true })` 嘗試刪除目前的暫存目錄（錯誤忽略；可能因行程終止而未完成）。
+3. 不處理 CDP 連線、不等待發佈。正在發佈時：同磁碟 rename 是原子操作，最終檔不會半成品；跨裝置複製被中斷只會留下 `.part`。
+
+此路徑與其他無法攔截的結束方式（Dock 圖示右鍵的「結束」、強制結束、當機、斷電）的殘留，一律由下次啟動時的清理補救（§6.9；見 §10）。UI 在擷取中與處理中畫面顯示提示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」。
 
 ### 6.12 UI（`ui/`）
 
@@ -371,12 +396,12 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 也就是說，連線中斷**不會**讓預覽、處理中、結果畫面消失：ready 的工作仍可開始處理（處理只用暫存檔，不需要 CDP），處理中的工作仍可取消，結果仍可查看；直到工作回到 idle（`discard()` 或 `reset()`）時，才依 `connected` 決定回到連線畫面或分頁清單。UI 在 extracting / processing 期間每 250 ms 輪詢 `getStatus()`，其他畫面在每次操作後呼叫 `getStatus()` 與 `getConnection()` 重新決定畫面。
 
 1. **連線**：進入時呼叫 `probe()`（探測位址見 §6.2 `probeTarget`），埠未開啟時每 2 秒自動重探。
-   - 未開啟：引導文字「請在 Chrome 網址列開啟 `chrome://inspect/#remote-debugging` 並打開遠端偵錯開關」＋目前探測位址＋「重試」與「設定」。
-   - 已開啟：顯示「偵測到 Chrome 偵錯埠」與「連線」按鈕；按下才呼叫 `connect()`，並提示「請在 Chrome 跳出的對話框按允許」。連線失敗顯示錯誤訊息並留在此畫面。
+   - 未開啟：引導文字「請在瀏覽器網址列開啟 `chrome://inspect/#remote-debugging` 並打開遠端偵錯開關（Brave 也可直接使用此網址）」＋目前探測位址＋「重試」與「設定」。
+   - 已開啟：顯示「偵測到瀏覽器偵錯埠」與「連線」按鈕；按下才呼叫 `connect()`，並提示「請在瀏覽器跳出的對話框按允許」。連線失敗顯示錯誤訊息並留在此畫面。
 2. **分頁清單**：`listTabs()` 結果（標題、URL），可「重新整理」；無符合分頁時顯示空狀態與目前的 `URL_PATTERN`。點選分頁 → `extract()`。
-3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組。
+3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組，並顯示提示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」（§6.11 B）。
 4. **預覽**：info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`；「開始處理」與「取消」（`discard()`）。第一次以 `startProcess(filename, null)` 呼叫；回傳 `needsConfirm` 時以原生 `confirm()` 顯示 `finalPath` 詢問是否覆蓋，同意則以 `startProcess(filename, finalPath)` 重呼叫。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
-5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。
+5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。同樣顯示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」提示。
 6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。有 `cleanupWarning` 時額外顯示「暫存檔未能刪除：<路徑>」提醒。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
 - `app.js` 定義 `window.__showShuttingDown()`，顯示覆蓋全畫面的「正在結束…」遮罩並停止輪詢（§6.11）。
@@ -386,11 +411,11 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - `deno.json` tasks：
   - `dev`：`deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts`
-  - `build`：`deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/FFmpegDownloader.app main.ts`
+  - `build`：`deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/FFmpegDownloader main.ts`（產出 `dist/FFmpegDownloader.app`；`-o` 不可帶 `.app`，見 §3.1）
   - `test`：`deno test --allow-net --allow-read --allow-write --allow-run --allow-env`
   - `check`：`deno check main.ts src/ user/ tests/`；`lint`：`deno lint`；`fmt`：`deno fmt`
 - `--allow-net` 與 `--allow-run` 不限定目標，因為 CDP 位址與 ffmpeg 路徑皆可由使用者修改。
-- `deno.json` `compilerOptions.lib` 需包含 `"deno.ns"` 與 `"dom"`，使 `user/page-script.js` 的 JSDoc 與 `ui/app.js` 不影響型別檢查（`ui/app.js` 不納入 `deno check`）。
+- `deno.json` 設定 `"compilerOptions": { "lib": ["deno.desktop", "deno.unstable", "dom"] }`：`deno.desktop` 提供 `Deno.BrowserWindow` 等型別（一般 `deno check` 預設不含），`dom` 讓 `user/page-script.js` 的頁面端程式碼可型別檢查（§3.1 已實測此組合可通過）。`ui/app.js` 不納入 `deno check`。
 
 ## 8. 錯誤處理總表
 
@@ -398,7 +423,9 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 | --- | --- |
 | CDP 埠未開啟 | 連線畫面引導 + 自動重探 |
 | `DevToolsActivePort` 不存在 / 格式錯誤 / port 不符 | `connect()` 失敗，顯示 §6.3 的訊息 |
-| 使用者在 Chrome 拒絕授權或逾時 | `connect()` 失敗，提示可再試 |
+| 使用者在瀏覽器拒絕授權或逾時 | `connect()` 失敗，提示可再試 |
+| 選到休眠或尚未載入的分頁 | 3 秒存活檢查逾時 → failed(extract)，提示先在瀏覽器點開該分頁（§6.6） |
+| 視窗關閉鈕 / Cmd+W | 立即結束，只做同步盡力收尾（§6.11 B） |
 | 連線中途斷開 | `connected=false`；進行中的擷取失敗；ready / processing / 結果畫面不受影響，工作回到 idle 後才顯示連線畫面（§6.12） |
 | 頁面腳本例外 / 回傳格式不符 | failed(extract)，顯示例外訊息 |
 | 擷取中分頁關閉或重新載入 | failed(extract)，訊息見 §6.6 |
@@ -413,9 +440,9 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 使用 `deno test` 與 `jsr:@std/assert`。
 
-- **純函式單元測試**：`parseDevToolsActivePort`（正常、缺第二行、port 非法、path 非 `/` 開頭、多餘空行）、`resolveBrowserWsUrl`（`cdpWsUrl` 優先、檔案不存在、port 不符；使用測試建立的暫存目錄放 `DevToolsActivePort`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
+- **純函式單元測試**：`parseDevToolsActivePort`（正常、缺第二行、port 非法、path 非 `/` 開頭、多餘空行）、`resolveBrowserWsUrl`（`cdpWsUrl` 優先、指定 `browserUserDataDir` 時只看該路徑、自動偵測時依序選第一個 port 相符的候選、全部失敗時錯誤訊息列出每個路徑與原因；候選路徑以參數覆寫為測試建立的暫存目錄，生產程式的預設候選清單維持 §6.3）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
-- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
+- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、存活檢查（假 server 對 `"1"` 不回應時 3 秒內以「分頁尚未載入」失敗，且不送出使用者腳本），以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、存在檢查丟出非 NotFound 錯誤時進入 failed(process) 且暫存目錄被刪除、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
@@ -423,27 +450,33 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.x.mp4.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
 - **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
-- **手動驗收清單**（`deno desktop` 視窗與真 Chrome 無法自動化）：
-  1. Chrome 未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且 Chrome **未**跳出授權對話框（A1）。
-  2. 按連線 → Chrome 跳出授權對話框一次；允許後看到分頁清單。
+- **手動驗收清單**（`deno desktop` 視窗與真實瀏覽器無法自動化；以 Brave 執行）：
+  1. 瀏覽器未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且瀏覽器**未**跳出授權對話框。
+  2. 按連線 → 瀏覽器跳出授權對話框一次；允許後看到分頁清單。設定中 `browserUserDataDir` 留空即可自動找到 Brave。
   3. 完成一次工作後按「再一次」→ 不再跳出授權對話框。
   4. 擷取中關閉該分頁 → 顯示分頁已關閉的錯誤。
-  5. 處理中按取消 → 輸出資料夾無殘檔、暫存目錄已刪除。
-  6. `PROBE_DURATION=false` → 顯示不確定進度條。
-  7. 處理中按視窗關閉鈕、以及按 Cmd+Q → 顯示「正在結束…」，數秒內關閉；之後 `ps` 中沒有殘留的 ffmpeg，暫存目錄已刪除（A6）。
-  8. `deno task build` 產出的 `.app` 能開啟並完成上述流程（A4）。
+  5. 選一個休眠中（未點開過）的分頁 → 約 3 秒後顯示「分頁尚未載入」；點開該分頁後重試成功。
+  6. 處理中按取消 → 輸出資料夾無殘檔、暫存目錄已刪除。
+  7. `PROBE_DURATION=false` → 顯示不確定進度條。
+  8. 處理中按 Cmd+Q → 顯示「正在結束…」，數秒內關閉；之後 `ps` 中沒有殘留的 ffmpeg，暫存目錄已刪除。
+  9. 處理中按視窗關閉鈕 → 立即關閉；之後 `ps` 中沒有殘留的 ffmpeg；下次啟動後暫存目錄殘留被清掉。
+  10. `deno task build` 產出的 `dist/FFmpegDownloader.app` 能開啟並完成上述流程。
 
 ## 10. Non-goals / Accepted limitations
 
 - 只支援 macOS（`open -R`、預設路徑皆為 macOS）；不處理 Windows/Linux。
-- 只支援 Google Chrome stable 的預設 user data dir 作為預設值；其他 Chromium 瀏覽器需使用者自行在設定中修改路徑或填寫 WS URL。
+- user data dir 自動偵測只涵蓋 Brave 與 Google Chrome stable；其他 Chromium 瀏覽器需使用者自行在設定中填寫路徑或 WS URL。
+- **視窗關閉鈕（Cmd+W）無法優雅收尾**
+  - Concern：處理中按關閉鈕時無法取消 ffmpeg、等待發佈或清理暫存。
+  - Decision：接受立即結束；只做同步盡力收尾（SIGKILL 子行程、`removeSync` 暫存目錄），殘留由下次啟動清理；優雅收尾只提供給 Cmd+Q。
+  - Rationale：Deno 2.9.7 的 close 事件不可取消，最後一個視窗關閉時行程立即結束（§3.1 實測與原始碼）；以隱藏保活視窗繞過的實驗不穩定且依賴未公開行為。使用者裁決採用此方案。
 - 不提供原生資料夾選擇器（`deno desktop` 尚未提供），輸出資料夾以文字路徑設定。
 - 同一時間只處理一個工作；不支援佇列或批次。
 - 啟動時清理 `ffdl-` 暫存目錄不考慮同時執行多個 App 實例的情況。
 - 不支援遠端（非本機）且需驗證的 CDP 端點。
 - 檔案大小以「數十 MB 以內」為設計目標；未針對 GB 級檔案最佳化（仍以 4 MiB 分塊、串流寫檔，不會整檔載入 Deno 記憶體，但頁面端需同時持有兩個 buffer）。
 - UI 只提供繁體中文。
-- 無法攔截的結束方式（Dock 右鍵「結束」、強制結束、當機、斷電）不保證收尾：可能殘留子行程以外的暫存目錄與 `.part` 檔，由下次啟動清理；若期間修改過 `outputDir`，舊資料夾中的 `.part` 不會被清理。
+- 無法攔截的結束方式（視窗關閉鈕、Dock 右鍵「結束」、強制結束、當機、斷電）不保證收尾：可能殘留暫存目錄與 `.part` 檔，由下次啟動清理；若期間修改過 `outputDir`，舊資料夾中的 `.part` 不會被清理。
 - 擷取中結束程式時 CDP 連線直接關閉，頁面端 `window.__ffdl[token]` 可能殘留到該分頁重新載入為止。
 - **輸出檔撞名競態**
   - Concern：使用者選擇不覆蓋（或確認時檔案不存在）之後，若 ffmpeg 處理期間有其他程式在輸出資料夾建立同名檔，最後發佈時的 rename 會靜默取代該檔。
