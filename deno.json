@@ -7,6 +7,9 @@
     "@std/path": "jsr:@std/path@^1.1.6"
   },
   "exclude": ["dist/"],
+  "fmt": {
+    "exclude": ["docs/"]
+  },
   "tasks": {
     "dev": "deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts",
     "build": "deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/TabRipper main.ts",
