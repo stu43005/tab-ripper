@@ -280,7 +280,7 @@ type JobStatus =
 
 1. 同步（第一個 `await` 之前）：檢查狀態為 ready、`sanitizeFilename(filename)`（失敗則丟錯、狀態不變）；**快照**本次工作使用的設定（`outputDir`、`ffmpegPath`、`ffprobePath`）並算出絕對路徑 `finalPath = <outputDir>/<filename>`，此後本工作的存在檢查、確認、發佈與結果回報都只使用這份快照，處理期間修改設定不影響進行中的工作；切到 processing（phase=preparing）、`cancelRequested = false`。
 2. `outputDir` 不存在時遞迴建立；失敗 → failed(process)。
-3. `finalPath` 已存在且 `confirmedOverwritePath !== finalPath` → 狀態**還原為原本的 ready**，回傳 `{ needsConfirm: true, finalPath }`。UI 以 `confirm()` 顯示該完整路徑詢問是否覆蓋，同意後以 `startProcess(filename, finalPath)` 重呼叫。覆蓋許可因此綁定在確切的路徑上：若兩次呼叫之間檔名或 `outputDir` 改變，新的 `finalPath` 與許可不符，會重新詢問。
+3. `finalPath` 已存在且 `confirmedOverwritePath !== finalPath` → 狀態**還原為原本的 ready**，回傳 `{ needsConfirm: true, finalPath }`。UI 以 `confirm()` 顯示該完整路徑詢問是否覆蓋，同意後以 `startProcess(filename, finalPath)` 重呼叫。覆蓋許可因此綁定在確切的路徑上：若兩次呼叫之間檔名或 `outputDir` 改變，新的 `finalPath` 與許可不符，會重新詢問。**此回傳不是終止結果**：暫存目錄（含 main/aux）必須保留給後續的 `startProcess` 重呼叫使用，因此步驟 2–3 位於步驟 9 的清理範圍（`try/finally`）之外；只有進入步驟 4 之後的路徑才會觸發終止清理。
 4. `PROBE_DURATION` 為 true 時以 `probeDuration` 取得長度（失敗 → `null`），否則 `null`。
 5. 每個 `await` 之後檢查 `cancelRequested`；為 true 時**不啟動 ffmpeg**，直接進入清理並以 cancelled 結束。
 6. phase=running，啟動 ffmpeg。輸出先寫到 `<tempDir>/out/<filename>`（`buildFfmpegArgs` 收到的 `outputPath`），避免取消或失敗時在輸出資料夾留下殘檔。
@@ -289,7 +289,7 @@ type JobStatus =
    - 先嘗試 `Deno.rename(tempOutput, finalPath)`（同一磁碟時為原子操作）。
    - 若因跨裝置失敗：先 `copyFile` 到輸出資料夾內的暫存名稱 `<outputDir>/.<filename>.ffdl-<隨機>.part`，確認大小與來源一致後，再以同資料夾內的 `Deno.rename` 換成 `finalPath`（原子操作）。複製或確認失敗時刪除 `.part` 檔、保留既有的 `finalPath` 不動 → failed(process)，訊息附系統錯誤。
    - 成功 → done。
-9. `finally`：刪除整個暫存目錄，之後才設定終止狀態。
+9. 步驟 4–8 包在 `try/finally` 中，`finally` 刪除整個暫存目錄，之後才設定終止狀態。步驟 2 建立資料夾失敗時同樣進入清理並設為 failed(process)；步驟 3 的 `needsConfirm` 回傳不清理（見上）。
 
 暫存清理：
 
@@ -411,7 +411,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
 - **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
-- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
+- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
 - **啟動殘留清理**：在測試建立的暫存位置放入 `ffdl-*` 目錄與 `.x.mp4.ffdl-abc.part` 檔，驗證清理後被刪除、其他檔案不受影響。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
