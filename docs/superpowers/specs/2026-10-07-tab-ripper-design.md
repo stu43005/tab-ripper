@@ -1,4 +1,6 @@
-# CDP 擷取 + ffmpeg 處理桌面程式 設計規格
+# Tab Ripper 設計規格
+
+> 專案名稱：**Tab Ripper**（識別名稱 `tab-ripper`，App 名稱 `TabRipper.app`）——從瀏覽器分頁擷取（rip）檔案並以 ffmpeg 處理的桌面程式。
 
 - 日期：2026-10-07
 - 狀態：設計已與使用者確認，待 spec review
@@ -57,7 +59,7 @@
 ## 4. 架構
 
 ```
-ffmpeg-downloader/
+tab-ripper/               # repo 根目錄（目前本機資料夾名稱仍為 ffmpeg-downloader，是否更名由使用者決定）
 ├─ deno.json              # imports、tasks（dev / build / test / check / lint / fmt）
 ├─ main.ts                # 入口：建立 BrowserWindow、註冊 bindings、Deno.serve 提供 UI
 ├─ src/
@@ -157,7 +159,7 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 
 ### 6.1 `settings.ts`
 
-- 檔案位置：`$HOME/Library/Application Support/ffmpeg-downloader/settings.json`。
+- 檔案位置：`$HOME/Library/Application Support/tab-ripper/settings.json`。
 - 欄位與預設值：
 
 | 欄位 | 預設 | 說明 |
@@ -330,7 +332,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 ### 6.10 `main.ts` 與 bindings
 
-- `new Deno.BrowserWindow({ title: "FFmpeg Downloader", width: 960, height: 720 })`。
+- `new Deno.BrowserWindow({ title: "Tab Ripper", width: 960, height: 720 })`。
 - `Deno.serve` 路由：`/` → `index.html`、`/app.js`、`/style.css`（內容來自 `src/ui-assets.ts` 的 text import，設定正確的 `content-type`），其他路徑 404。
 - Bindings（頁面端 `await bindings.x(...)`）：
 
@@ -352,7 +354,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - bindings 內丟出的錯誤以訊息字串傳回頁面端，由 UI 顯示。
 - 應用程式選單以 `win.setApplicationMenu()` 自訂（不使用 OS 處理、JS 攔截不到的 `role: "quit"`）：
-  - 第一個 submenu（macOS 應用程式選單）：自訂項目 `{ item: { label: "結束 FFmpeg Downloader", id: "quit", accelerator: "CmdOrCtrl+Q", enabled: true } }`。
+  - 第一個 submenu（macOS 應用程式選單）：自訂項目 `{ item: { label: "結束 Tab Ripper", id: "quit", accelerator: "CmdOrCtrl+Q", enabled: true } }`。
   - 「編輯」submenu：`undo`、`redo`、`cut`、`copy`、`paste`、`selectAll` role，讓檔名與設定輸入框的快捷鍵正常運作。
   - `menuclick` 事件 `e.detail.id === "quit"` 時進入 §6.11 的結束流程。
 
@@ -417,7 +419,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - `deno.json` tasks：
   - `dev`：`deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts`
-  - `build`：`deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/FFmpegDownloader main.ts`（產出 `dist/FFmpegDownloader.app`；`-o` 不可帶 `.app`，見 §3.1）
+  - `build`：`deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/TabRipper main.ts`（產出 `dist/TabRipper.app`；`-o` 不可帶 `.app`，見 §3.1）
   - `test`：`deno test --allow-net --allow-read --allow-write --allow-run --allow-env`
   - `check`：`deno check main.ts src/ user/ tests/`；`lint`：`deno lint`；`fmt`：`deno fmt`
 - `--allow-net` 與 `--allow-run` 不限定目標，因為 CDP 位址與 ffmpeg 路徑皆可由使用者修改。
@@ -468,7 +470,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
   7. `PROBE_DURATION=false` → 顯示不確定進度條。
   8. 處理中按 Cmd+Q → 顯示「正在結束…」，數秒內關閉；之後 `ps` 中沒有殘留的 ffmpeg，暫存目錄已刪除。
   9. 處理中按視窗關閉鈕 → 立即關閉；之後 `ps` 中沒有殘留的 ffmpeg；下次啟動後暫存目錄殘留被清掉。
-  10. `deno task build` 產出的 `dist/FFmpegDownloader.app` 能開啟並完成上述流程。
+  10. `deno task build` 產出的 `dist/TabRipper.app` 能開啟並完成上述流程。
 
 ## 10. Non-goals / Accepted limitations
 
