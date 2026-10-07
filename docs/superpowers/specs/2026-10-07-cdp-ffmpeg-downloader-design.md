@@ -231,7 +231,7 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 ### 6.8 `ffmpeg.ts`
 
 - `checkTool(path: string): Promise<{ ok: boolean; version?: string; error?: string }>`：執行 `<path> -version`，取第一行為版本。
-- `probeDuration(ffprobePath: string, file: string): Promise<number | null>`：執行 `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 <file>`，解析為正數秒；失敗或非數字 → `null`（不視為錯誤）。
+- `probeDuration(ffprobePath: string, file: string, signal: AbortSignal, timeoutMs = 15000): Promise<number | null>`：執行 `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 <file>`，解析為正數秒；失敗、非數字或逾時 → `null`（不視為錯誤）。逾時或 `signal` 觸發時 kill 子行程並等待它結束後才 resolve（`signal` 觸發時同樣回傳 `null`，由呼叫端依 `cancelRequested` 判斷結果）。
 - `parseProgress(chunk: string, state: ProgressState): ProgressEvent[]`：純函式，逐行解析 `key=value`；以 `out_time_us`（缺少時用 `out_time_ms`，ffmpeg 中兩者單位皆為微秒）換算秒數，值為 `N/A` 時忽略；解析 `speed`（如 `1.5x`，`N/A` → `null`）；遇到 `progress=continue|end` 發出一筆事件 `{ outTimeSec, speed, ended }`。需處理跨 chunk 被截斷的行（`state` 保留殘餘字串）。
 - `runFfmpeg(opts): FfmpegRun`：
   - `opts = { ffmpegPath, args, durationSec: number | null, onProgress }`。
@@ -253,9 +253,10 @@ type JobStatus =
   | { state: "processing"; phase: "preparing" | "running" | "publishing";
       percent: number | null; outTimeSec: number;
       durationSec: number | null; speed: number | null }
-  | { state: "done"; outputPath: string }
-  | { state: "failed"; stage: "extract" | "process"; message: string; detail?: string[] }
-  | { state: "cancelled" };
+  | { state: "done"; outputPath: string; cleanupWarning?: string }
+  | { state: "failed"; stage: "extract" | "process"; message: string; detail?: string[];
+      cleanupWarning?: string }
+  | { state: "cancelled"; cleanupWarning?: string };
 ```
 
 轉移規則：
@@ -265,12 +266,14 @@ type JobStatus =
 | `extract(targetId)` | idle / done / failed / cancelled | → extracting；建立暫存目錄 `Deno.makeTempDir({ prefix: "ffdl-" })`；成功 → ready；失敗 → failed(extract) 並刪除暫存目錄 |
 | `discard()` | ready | 刪除暫存目錄 → idle |
 | `startProcess(filename, overwrite)` | ready | 見下方 |
-| `cancel()` | processing（phase 為 preparing 或 running） | 設定 `cancelRequested = true`；若 ffmpeg 已啟動則呼叫 `FfmpegRun.cancel()`；清理完成後 → cancelled。phase 為 publishing 時呼叫則忽略（搬移不可中斷，以免輸出資料夾留下半成品） |
+| `cancel()` | processing（phase 為 preparing 或 running） | 設定 `cancelRequested = true`；觸發本工作的 `AbortController`（中止進行中的 ffprobe）；若 ffmpeg 已啟動則呼叫 `FfmpegRun.cancel()`；清理完成後 → cancelled。phase 為 publishing 時呼叫則忽略（搬移不可中斷，以免輸出資料夾留下半成品） |
 | `reset()` | done / failed / cancelled | → idle |
 
 其他狀態下呼叫上述動作 → 丟出錯誤「目前有工作進行中」（同一時間只允許一個工作）。
 
-**互斥保證**：所有動作在第一個 `await` 之前**同步**檢查並切換狀態（`extract` → extracting、`startProcess` → processing/preparing），因此重疊的 binding 呼叫中只有第一個能通過檢查，其餘立即得到「目前有工作進行中」。`discard()` 同步地把狀態設為 idle 並把暫存目錄路徑從 job 上摘除，再於背景刪除該目錄；被摘除的目錄不再被任何工作引用（新的 `extract` 一定建立新的暫存目錄），所以不會與後續工作互相干擾。done / failed / cancelled 這些終止狀態**只在暫存目錄清理完成後**才設定，所以終止狀態下可以安全接受新工作。
+**互斥保證**：所有動作在第一個 `await` 之前**同步**檢查並切換狀態（`extract` → extracting、`startProcess` → processing/preparing），因此重疊的 binding 呼叫中只有第一個能通過檢查，其餘立即得到「目前有工作進行中」。`discard()` 同步地把狀態設為 idle 並把暫存目錄路徑從 job 上摘除，再於背景刪除該目錄；被摘除的目錄不再被任何工作引用（新的 `extract` 一定建立新的暫存目錄），所以不會與後續工作互相干擾。done / failed / cancelled 這些終止狀態**在所有子行程結束、暫存目錄清理嘗試完成後**才設定，所以終止狀態下可以安全接受新工作。
+
+**清理失敗不阻擋狀態轉移**：工作結果（成功、失敗、取消）與清理結果分開處理。刪除暫存目錄失敗時，錯誤被捕捉，工作照樣進入它原本應得的終止狀態（例如發佈成功仍為 done），並在終止狀態附上 `cleanupWarning`（含殘留路徑），UI 在結果畫面顯示提醒。該目錄有 `ffdl-` 前綴，下次啟動時的清理會再嘗試刪除。`discard()` 的背景刪除失敗則只寫入 log，不影響狀態。
 
 `startProcess(filename, overwrite)`：
 
@@ -340,7 +343,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組。
 4. **預覽**：info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`；「開始處理」與「取消」（`discard()`）。`startProcess` 回傳 `needsConfirm` 時以原生 `confirm()` 詢問是否覆蓋。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
 5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。
-6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。皆有「再一次」（`reset()`，之後依上表決定畫面）。
+6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。有 `cleanupWarning` 時額外顯示「暫存檔未能刪除：<路徑>」提醒。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
 - 分頁清單畫面上的 binding 呼叫若回報連線已關閉，`connected` 變 false，依上表回到連線畫面。
 
@@ -379,7 +382,8 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
 - **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
-- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready）、running 中取消、preparing 中取消（ffmpeg 不會被啟動）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在暫存目錄刪除後出現。
+- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready）、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
+- **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
 - **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真 Chrome 無法自動化）：
   1. Chrome 未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且 Chrome **未**跳出授權對話框（A1）。
