@@ -83,14 +83,14 @@ This task has no behaviour to test (types and placeholders only); its gate is ty
     "dev": "deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts",
     "build": "deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/TabRipper main.ts",
     "test": "deno test --allow-net --allow-read --allow-write --allow-run --allow-env",
-    "check": "deno check src/ user/ tests/",
+    "check": "deno check src/ user/",
     "lint": "deno lint",
     "fmt": "deno fmt"
   }
 }
 ```
 
-(`check` gains `main.ts` in Task 20, once that file exists. `-o dist/TabRipper` produces `dist/TabRipper.app`; spec §3.1.)
+(`check` gains `tests/` in Task 2 and `main.ts` in Task 20, once those exist — `deno check` fails on a missing directory. `-o dist/TabRipper` produces `dist/TabRipper.app`; spec §3.1.)
 
 - [ ] **Step 2: Create `src/types.ts`**
 
@@ -143,7 +143,7 @@ export interface ProgressUpdate {
   outTimeSec: number;
   durationSec: number | null;
   speed: number | null;
-  /** Last stderr line printed by ffmpeg (spec §6.8). */
+  /** Last stderr line printed by ffmpeg. */
   message: string | null;
 }
 
@@ -205,12 +205,13 @@ export const PROBE_DURATION: boolean = true;
  *                     aux: ArrayBuffer | ArrayBufferView,
  *                     info: Record<string, string | number | boolean> }>}
  */
+// deno-lint-ignore require-await
 export default async function pageScript() {
   throw new Error("TODO: implement user/page-script.js");
 }
 ```
 
-(The `TODO` is the spec-mandated user extension stub, spec §5.2.)
+(The `TODO` is the spec-mandated user extension stub, spec §5.2. The lint suppression covers the stub only: an `async` function without `await` trips `require-await`; remove it once the real script awaits something.)
 
 - [ ] **Step 6: Create `user/info.ts`**
 
@@ -257,6 +258,9 @@ Use git-master to commit `deno.json`, `deno.lock` (if created), `src/types.ts`, 
 **Files:**
 - Create: `src/base64.ts`
 - Test: `tests/base64_test.ts`
+- Modify: `deno.json` (`check` task)
+
+- [ ] **Step 0: Include tests in type checking** — in `deno.json`, change `"check": "deno check src/ user/"` to `"check": "deno check src/ user/ tests/"` (the `tests/` directory is created in Step 1).
 
 - [ ] **Step 1: Write the failing test** — `tests/base64_test.ts`
 
@@ -303,9 +307,9 @@ Expected: 3 tests FAIL with `Error: not implemented`.
 - [ ] **Step 4: Implement** — replace `src/base64.ts`
 
 ```ts
-// Deno 2.9.7 and current Chromium both ship the TC39 base64 methods
-// (verified in spec §3.1), but the TypeScript lib may not declare them,
-// so they are reached through narrow casts.
+// Deno 2.9.7 and current Chromium both ship the TC39 base64 methods, but
+// the TypeScript lib may not declare them, so they are reached through
+// narrow casts.
 type Base64Constructor = { fromBase64(base64: string): Uint8Array };
 type Base64Bytes = Uint8Array & { toBase64(): string };
 
@@ -325,7 +329,7 @@ Expected: `ok | 3 passed | 0 failed`.
 
 - [ ] **Step 6: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
-- [ ] **Step 7: Commit** — git-master: `src/base64.ts`, `tests/base64_test.ts`, `deno.lock`; message `feat: add base64 helpers`.
+- [ ] **Step 7: Commit** — git-master: `deno.json`, `src/base64.ts`, `tests/base64_test.ts`, `deno.lock`; message `feat: add base64 helpers`.
 
 ---
 
@@ -403,7 +407,7 @@ Expected: FAIL — the parsing tests report `Error: not implemented`; the reject
 - [ ] **Step 4: Implement** — replace `src/cdp/address.ts`
 
 ```ts
-// The app never reads browser data dirs (spec §6.3); it only needs host:port.
+// The app never reads browser data dirs; it only needs host:port.
 const FORMAT_ERROR = "CDP 位址格式應為 主機:埠，例如 127.0.0.1:9222";
 
 export function parseCdpAddress(address: string): { host: string; port: number } {
@@ -419,7 +423,7 @@ export function parseCdpAddress(address: string): { host: string; port: number }
   return { host, port };
 }
 
-/** Toggle-mode endpoints accept `/devtools/browser` without the uuid (spec §3.1 A7). */
+/** Toggle-mode endpoints accept `/devtools/browser` without the uuid. */
 export function browserWsUrl(address: string): string {
   const { host, port } = parseCdpAddress(address);
   return `ws://${host}:${port}/devtools/browser`;
@@ -491,8 +495,7 @@ import { parseCdpAddress } from "./address.ts";
 
 /**
  * TCP connect + immediate close. No bytes are sent and no WebSocket
- * handshake happens, so the browser's permission dialog is not triggered
- * (spec §3.1 A1).
+ * handshake happens, so the browser's permission dialog is not triggered.
  */
 export async function probeCdpPort(address: string, timeoutMs = 1000): Promise<boolean> {
   let host: string;
@@ -596,7 +599,7 @@ Expected: FAIL — value tests throw `not implemented`; the rejection test fails
 // deno-lint-ignore no-control-regex
 const FORBIDDEN = /[/\\:*?"<>|\u0000-\u001f\u007f]/g;
 
-/** Spec §6.7: strip forbidden/control chars, trim, drop leading dots. */
+/** Strips forbidden/control chars, trims, and drops leading dots. */
 export function sanitizeFilename(name: string): string {
   const cleaned = name.replace(FORBIDDEN, "").trim().replace(/^[.\s]+/, "").trim();
   if (cleaned === "") throw new Error("檔名無效");
@@ -651,7 +654,7 @@ Deno.test("settingsPath lives under Application Support/tab-ripper", async () =>
   });
 });
 
-Deno.test("defaultSettings matches spec §6.1", async () => {
+Deno.test("defaultSettings returns the expected application defaults", async () => {
   await withHome((home) => {
     assertEquals(defaultSettings(), {
       cdpAddress: "127.0.0.1:9222",
@@ -858,6 +861,7 @@ The stats-line format and `\r` separators were verified against ffmpeg 8.0 (spec
 ```ts
 import { assertEquals } from "@std/assert";
 import {
+  flushStderr,
   newProgressState,
   newStderrState,
   parseProgress,
@@ -890,6 +894,24 @@ Deno.test("parseProgress falls back to out_time_ms (microseconds)", () => {
   const state = newProgressState();
   const events = parseProgress("out_time_ms=500000\nprogress=continue\n", state);
   assertEquals(events, [{ outTimeSec: 0.5, speed: null, ended: false }]);
+});
+
+Deno.test("parseProgress prefers out_time_us over out_time_ms within a block", () => {
+  const usFirst = newProgressState();
+  assertEquals(
+    parseProgress("out_time_us=2000000\nout_time_ms=1000000\nprogress=continue\n", usFirst),
+    [{ outTimeSec: 2, speed: null, ended: false }],
+  );
+  const msFirst = newProgressState();
+  assertEquals(
+    parseProgress("out_time_ms=1000000\nout_time_us=2000000\nprogress=continue\n", msFirst),
+    [{ outTimeSec: 2, speed: null, ended: false }],
+  );
+  // The next block without out_time_us falls back to out_time_ms.
+  assertEquals(
+    parseProgress("out_time_ms=3000000\nprogress=continue\n", msFirst),
+    [{ outTimeSec: 3, speed: null, ended: false }],
+  );
 });
 
 Deno.test("parseProgress joins lines split across chunks", () => {
@@ -937,6 +959,19 @@ Deno.test("splitStderr skips empty and whitespace-only segments", () => {
   const state = newStderrState();
   assertEquals(splitStderr("\n\n   \n\r\rtext\n", state), [{ segment: "text", transient: false }]);
 });
+
+Deno.test("flushStderr emits an unterminated final line as permanent", () => {
+  const state = newStderrState();
+  assertEquals(splitStderr("fatal-error", state), []);
+  assertEquals(flushStderr(state), [{ segment: "fatal-error", transient: false }]);
+  assertEquals(flushStderr(state), []);
+});
+
+Deno.test("flushStderr keeps a trailing lone \\r transient", () => {
+  const state = newStderrState();
+  assertEquals(splitStderr("frame=  1 time=00:00:00.10    \r", state), []);
+  assertEquals(flushStderr(state), [{ segment: "frame=  1 time=00:00:00.10", transient: true }]);
+});
 ```
 
 - [ ] **Step 2: Create the skeleton** — `src/ffmpeg.ts`
@@ -946,6 +981,9 @@ export interface ProgressState {
   buffer: string;
   outTimeSec: number;
   speed: number | null;
+  /** out_time_us / out_time_ms seen in the current block (microseconds). */
+  blockUs: number | null;
+  blockMs: number | null;
 }
 
 export interface ProgressEvent {
@@ -965,7 +1003,7 @@ export interface StderrSegment {
 }
 
 export function newProgressState(): ProgressState {
-  return { buffer: "", outTimeSec: 0, speed: null };
+  return { buffer: "", outTimeSec: 0, speed: null, blockUs: null, blockMs: null };
 }
 
 export function newStderrState(): StderrState {
@@ -979,17 +1017,25 @@ export function parseProgress(_chunk: string, _state: ProgressState): ProgressEv
 export function splitStderr(_chunk: string, _state: StderrState): StderrSegment[] {
   throw new Error("not implemented");
 }
+
+export function flushStderr(_state: StderrState): StderrSegment[] {
+  throw new Error("not implemented");
+}
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/ffmpeg_parse_test.ts`
-Expected: 10 tests FAIL with `Error: not implemented`.
+Expected: 13 tests FAIL with `Error: not implemented`.
 
-- [ ] **Step 4: Implement** — replace the two function bodies in `src/ffmpeg.ts`
+- [ ] **Step 4: Implement** — replace the three skeleton function bodies in `src/ffmpeg.ts`
 
 ```ts
-/** Parses `-progress pipe:1` key=value output; one event per `progress=` line. */
+/**
+ * Parses `-progress pipe:1` key=value output; one event per `progress=` line.
+ * Within a block out_time_us wins; out_time_ms (also microseconds in ffmpeg)
+ * is only a fallback when the block has no usable out_time_us.
+ */
 export function parseProgress(chunk: string, state: ProgressState): ProgressEvent[] {
   const events: ProgressEvent[] = [];
   const lines = (state.buffer + chunk).split("\n");
@@ -1001,14 +1047,19 @@ export function parseProgress(chunk: string, state: ProgressState): ProgressEven
     const key = line.slice(0, eq);
     const value = line.slice(eq + 1).trim();
     if (key === "out_time_us" || key === "out_time_ms") {
-      // ffmpeg reports both keys in microseconds.
       if (value === "N/A") continue;
       const micros = Number(value);
-      if (Number.isFinite(micros) && micros >= 0) state.outTimeSec = micros / 1_000_000;
+      if (!Number.isFinite(micros) || micros < 0) continue;
+      if (key === "out_time_us") state.blockUs = micros;
+      else state.blockMs = micros;
     } else if (key === "speed") {
       const match = /^([\d.]+)x$/.exec(value);
       state.speed = match ? Number(match[1]) : null;
     } else if (key === "progress") {
+      const micros = state.blockUs ?? state.blockMs;
+      if (micros !== null) state.outTimeSec = micros / 1_000_000;
+      state.blockUs = null;
+      state.blockMs = null;
       events.push({ outTimeSec: state.outTimeSec, speed: state.speed, ended: value === "end" });
     }
   }
@@ -1049,12 +1100,25 @@ export function splitStderr(chunk: string, state: StderrState): StderrSegment[] 
   state.buffer = buffer;
   return segments;
 }
+
+/**
+ * Emits whatever is still buffered at EOF. A pending lone \r keeps its
+ * transient classification; an unterminated line counts as permanent so a
+ * final error message still reaches the stderr tail.
+ */
+export function flushStderr(state: StderrState): StderrSegment[] {
+  const segment = state.buffer.trim();
+  const transient = state.pendingCR;
+  state.buffer = "";
+  state.pendingCR = false;
+  return segment === "" ? [] : [{ segment, transient }];
+}
 ```
 
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/ffmpeg_parse_test.ts`
-Expected: `ok | 10 passed | 0 failed`.
+Expected: `ok | 13 passed | 0 failed`.
 
 - [ ] **Step 6: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -1370,12 +1434,46 @@ Deno.test({
   },
 });
 
+Deno.test("runFfmpeg keeps an unterminated final stderr line in the tail", async () => {
+  const dir = await makeTempDir();
+  try {
+    const fatal = await makeExecutable(dir, "ffmpeg-fatal", "printf 'fatal-error' >&2\nexit 3");
+    const { updates, onProgress } = collector();
+    const run = runFfmpeg({ ffmpegPath: fatal, args: [], durationSec: null, onProgress });
+    const { code, stderrTail } = await run.done;
+    assertEquals(code, 3);
+    assertEquals(stderrTail, ["fatal-error"]);
+    assertEquals(updates[updates.length - 1].message, "fatal-error");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("runFfmpeg calls onProgress for every stderr segment in a chunk", async () => {
+  const dir = await makeTempDir();
+  try {
+    const multi = await makeExecutable(dir, "ffmpeg-multi", "printf 'one\\ntwo\\nthree\\n' >&2");
+    const { updates, onProgress } = collector();
+    const run = runFfmpeg({ ffmpegPath: multi, args: [], durationSec: null, onProgress });
+    await run.done;
+    assertEquals(updates.map((u) => u.message), ["one", "two", "three"]);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test("runFfmpeg cancel escalates to SIGKILL when SIGTERM is ignored", async () => {
   const dir = await makeTempDir();
   try {
-    const stubborn = await makeExecutable(dir, "ffmpeg-stubborn", "trap '' TERM\nexec sleep 30");
+    const ready = join(dir, "trap-installed");
+    const stubborn = await makeExecutable(
+      dir,
+      "ffmpeg-stubborn",
+      `trap '' TERM\ntouch "${ready}"\nexec sleep 30`,
+    );
     const run = runFfmpeg({ ffmpegPath: stubborn, args: [], durationSec: null, onProgress: () => {} });
-    await waitFor(() => activeChildCount() === 1, "stubborn start");
+    // The child signals readiness only after the TERM trap is installed.
+    await waitFor(() => pathExists(ready), "trap installed");
     const start = Date.now();
     run.cancel();
     await run.done;
@@ -1391,7 +1489,7 @@ Deno.test("runFfmpeg cancel escalates to SIGKILL when SIGTERM is ignored", async
 - [ ] **Step 3: Add the skeleton** — append to `src/ffmpeg.ts`
 
 ```ts
-import type { ProgressUpdate, ToolCheck } from "./types.ts";
+import type { ProgressUpdate, ToolCheck } from "./types.ts"; // move to the top of the file
 
 export type ProgressUpdateCallback = (update: ProgressUpdate) => void;
 
@@ -1444,7 +1542,7 @@ Expected: every test FAILs with `Error: not implemented` (ffmpeg tests are repor
 
 ```ts
 // Every child this module spawns is registered so shutdown paths can kill
-// them synchronously: Deno.exit() does not terminate children (spec §3.1).
+// them synchronously: Deno.exit() does not terminate children.
 const children = new Set<Deno.ChildProcess>();
 
 function track(child: Deno.ChildProcess): void {
@@ -1574,19 +1672,26 @@ export function runFfmpeg(opts: FfmpegRunOptions): FfmpegRun {
     }
   })();
 
+  // Every message update triggers onProgress; transient stats lines never
+  // enter the error tail.
+  const handleSegments = (segments: StderrSegment[]) => {
+    for (const { segment, transient } of segments) {
+      message = segment;
+      if (!transient) {
+        stderrTail.push(segment);
+        if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.shift();
+      }
+      emit();
+    }
+  };
+
   const readStderr = (async () => {
     const decoder = new TextDecoder();
     for await (const chunk of child.stderr) {
-      const segments = splitStderr(decoder.decode(chunk, { stream: true }), stderrState);
-      for (const { segment, transient } of segments) {
-        message = segment;
-        if (!transient) {
-          stderrTail.push(segment);
-          if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.shift();
-        }
-      }
-      if (segments.length > 0) emit();
+      handleSegments(splitStderr(decoder.decode(chunk, { stream: true }), stderrState));
     }
+    handleSegments(splitStderr(decoder.decode(), stderrState));
+    handleSegments(flushStderr(stderrState));
   })();
 
   let killTimer: number | undefined;
@@ -1610,7 +1715,7 @@ export function runFfmpeg(opts: FfmpegRunOptions): FfmpegRun {
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `deno task test tests/ffmpeg_process_test.ts`
-Expected: `ok | 13 passed | 0 failed`.
+Expected: `ok | 15 passed | 0 failed`.
 
 - [ ] **Step 7: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -1629,7 +1734,7 @@ Expected: `ok | 13 passed | 0 failed`.
 ```ts
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { join } from "@std/path";
-import { copyThenRename, publishOutput } from "../src/publish.ts";
+import { copyThenRename, isCrossDeviceError, publishOutput } from "../src/publish.ts";
 import { listDir, makeTempDir, pathExists } from "./helpers/fixtures.ts";
 
 async function withDirs(fn: (src: string, dest: string) => Promise<void>): Promise<void> {
@@ -1663,12 +1768,49 @@ Deno.test("publishOutput replaces an existing destination", async () => {
   });
 });
 
+Deno.test("isCrossDeviceError recognises only EXDEV", () => {
+  // Deno reports a cross-volume rename as a plain Error with code "EXDEV"
+  // (verified with a RAM disk on Deno 2.9.7).
+  const exdev = Object.assign(new Error("Cross-device link (os error 18)"), { code: "EXDEV" });
+  const eacces = Object.assign(new Error("Permission denied (os error 13)"), { code: "EACCES" });
+  assertEquals(isCrossDeviceError(exdev), true);
+  assertEquals(isCrossDeviceError(eacces), false);
+  assertEquals(isCrossDeviceError(new Deno.errors.NotFound("x")), false);
+  assertEquals(isCrossDeviceError("EXDEV"), false);
+});
+
+Deno.test("publishOutput propagates a non-cross-device rename failure without copying", async () => {
+  await withDirs(async (src, dest) => {
+    const from = join(src, "out.mp4");
+    await Deno.writeTextFile(from, "new");
+    await Deno.chmod(dest, 0o500);
+    try {
+      await assertRejects(() => publishOutput(from, join(dest, "final.mp4")));
+    } finally {
+      await Deno.chmod(dest, 0o755);
+    }
+    assertEquals(await listDir(dest), []);
+    assert(await pathExists(from));
+  });
+});
+
 Deno.test("copyThenRename copies through a staging file and leaves no .part", async () => {
   await withDirs(async (src, dest) => {
     const from = join(src, "out.mp4");
     await Deno.writeTextFile(from, "payload");
     await copyThenRename(from, join(dest, "final.mp4"));
     assertEquals(await Deno.readTextFile(join(dest, "final.mp4")), "payload");
+    assertEquals(await listDir(dest), ["final.mp4"]);
+  });
+});
+
+Deno.test("copyThenRename replaces an existing destination", async () => {
+  await withDirs(async (src, dest) => {
+    const from = join(src, "out.mp4");
+    await Deno.writeTextFile(from, "new");
+    await Deno.writeTextFile(join(dest, "final.mp4"), "old");
+    await copyThenRename(from, join(dest, "final.mp4"));
+    assertEquals(await Deno.readTextFile(join(dest, "final.mp4")), "new");
     assertEquals(await listDir(dest), ["final.mp4"]);
   });
 });
@@ -1713,6 +1855,10 @@ Deno.test("copyThenRename removes the staging file when the final rename fails",
 The skeleton resolves without doing anything, so every test fails on its own assertion (missing file, or "Expected function to reject") rather than on a thrown placeholder.
 
 ```ts
+export function isCrossDeviceError(_error: unknown): boolean {
+  return false;
+}
+
 export function publishOutput(_src: string, _finalPath: string): Promise<void> {
   return Promise.resolve();
 }
@@ -1725,7 +1871,7 @@ export function copyThenRename(_src: string, _finalPath: string): Promise<void> 
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/publish_test.ts`
-Expected: 6 tests FAIL — the four success-path tests with `NotFound` / content mismatches on the destination, the two failure-path tests with `Expected function to reject`.
+Expected: all 9 tests FAIL — `isCrossDeviceError` returns false for EXDEV, the success-path tests hit `NotFound` / content mismatches on the destination, and the failure-path tests report `Expected function to reject`.
 
 - [ ] **Step 4: Implement** — replace `src/publish.ts`
 
@@ -1733,20 +1879,23 @@ Expected: 6 tests FAIL — the four success-path tests with `NotFound` / content
 import { dirname, join } from "@std/path";
 import { SESSION_ID } from "./session.ts";
 
+/** Deno reports a cross-volume rename as an Error whose `code` is "EXDEV". */
+export function isCrossDeviceError(error: unknown): boolean {
+  return error instanceof Error && (error as Error & { code?: unknown }).code === "EXDEV";
+}
+
 /**
- * Moves the finished output into place (spec §6.9 step 8). A same-volume
- * rename is atomic; any rename failure (EXDEV across volumes, among others)
- * falls back to a staged copy, which surfaces the real error if the
- * destination itself is unusable.
+ * Moves the finished output into place. A same-volume rename is atomic.
+ * Only a cross-device rename falls back to a staged copy; any other rename
+ * error propagates so the caller can report a destination failure.
  */
 export async function publishOutput(src: string, finalPath: string): Promise<void> {
   try {
     await Deno.rename(src, finalPath);
-    return;
-  } catch {
-    // Fall through to the copy path.
+  } catch (error) {
+    if (!isCrossDeviceError(error)) throw error;
+    await copyThenRename(src, finalPath);
   }
-  await copyThenRename(src, finalPath);
 }
 
 /**
@@ -1771,11 +1920,11 @@ export async function copyThenRename(src: string, finalPath: string): Promise<vo
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/publish_test.ts`
-Expected: `ok | 6 passed | 0 failed`.
+Expected: `ok | 9 passed | 0 failed`.
 
 - [ ] **Step 6: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
-- [ ] **Step 7: Commit** — git-master: `src/publish.ts`, `tests/publish_test.ts`; message `feat: publish outputs atomically with staged copy fallback`.
+- [ ] **Step 7: Commit** — git-master: `src/publish.ts`, `tests/publish_test.ts`; message `feat: publish outputs atomically with cross-device copy fallback`.
 
 ---
 
@@ -1884,7 +2033,7 @@ Expected: 4 tests FAIL with `Error: not implemented`.
 import { dirname, join } from "@std/path";
 import { SESSION_ID } from "./session.ts";
 
-/** The OS temp root: parent of a freshly created temp dir (spec §6.9). */
+/** The OS temp root: parent of a freshly created temp dir. */
 export async function systemTempRoot(): Promise<string> {
   const probe = await Deno.makeTempDir({ prefix: "tabripper-root-" });
   await Deno.remove(probe);
@@ -1894,7 +2043,7 @@ export async function systemTempRoot(): Promise<string> {
 /**
  * Best-effort removal of artifacts left by earlier runs: `ffdl-*` temp dirs
  * and `.ffdl-*.part` staging files. Anything carrying the current SESSION_ID
- * is skipped. Never throws; failures are only logged (spec §6.9).
+ * is skipped. Never throws; failures are only logged.
  */
 export async function cleanupStaleArtifacts(tempRoot: string, outputDir: string): Promise<void> {
   await removeMatching(
@@ -2348,7 +2497,7 @@ interface Pending {
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
-/** Minimal browser-level CDP client (spec §6.4). */
+/** Minimal browser-level CDP client. */
 export class CdpClient {
   readonly closed: Promise<void>;
   #ws: WebSocket;
@@ -2614,7 +2763,7 @@ Expected: 3 tests FAIL with `Error: not implemented`.
 import type { CdpClient } from "./cdp/client.ts";
 import type { TabInfo } from "./types.ts";
 
-/** A copy without g/y so `test()` never depends on lastIndex (spec §5.1). */
+/** A copy without g/y so `test()` never depends on lastIndex. */
 export function statelessPattern(pattern: RegExp): RegExp {
   return new RegExp(pattern.source, pattern.flags.replace("g", "").replace("y", ""));
 }
@@ -2626,7 +2775,7 @@ interface RawTargetInfo {
   url: string;
 }
 
-/** Page targets whose URL matches `pattern`, in CDP order (spec §6.5). */
+/** Page targets whose URL matches `pattern`, in CDP order. */
 export async function listTabs(client: CdpClient, pattern: RegExp): Promise<TabInfo[]> {
   const re = statelessPattern(pattern);
   const { targetInfos } = await client.send<{ targetInfos: RawTargetInfo[] }>("Target.getTargets");
@@ -2810,7 +2959,7 @@ Expected: 9 tests FAIL on assertions (marker missing, result `undefined`, `Expec
 import { statelessPattern } from "./tabs.ts";
 
 /**
- * Expression evaluated in the tab (spec §6.6 step 3). It checks the page URL
+ * Expression evaluated in the tab. It checks the page URL
  * against the URL pattern BEFORE running the user script, validates the
  * result, stores both buffers under `window.__ffdl[token]` and returns only
  * the info and sizes. The leading comment carries metadata for test fakes.
@@ -2850,7 +2999,7 @@ export function buildWrapperExpression(token: string, pattern: RegExp, scriptSou
 })()`;
 }
 
-/** Returns `[offset, offset + length)` of a stored buffer as base64 (spec §6.6 step 5). */
+/** Returns `[offset, offset + length)` of a stored buffer as base64. */
 export function buildReadExpression(
   token: string,
   name: "main" | "aux",
@@ -2912,7 +3061,7 @@ export interface FakePageOptions {
   aux?: Uint8Array;
   info?: Record<string, unknown>;
   targets?: FakeTarget[];
-  /** Never answer Runtime.evaluate (a discarded tab, spec §3.1). */
+  /** Never answer Runtime.evaluate (a discarded tab). */
   dormant?: boolean;
   /** Answer the wrapper with a page exception carrying this message. */
   wrapperException?: string;
@@ -2924,6 +3073,10 @@ export interface FakePageOptions {
   closeDuringWrapper?: boolean;
   /** Answer the wrapper but lose the stored data (page reloaded). */
   dropDataAfterWrapper?: boolean;
+  /** Emit Target.detachedFromTarget right after answering the last chunk read. */
+  detachAfterLastRead?: boolean;
+  /** Close the socket right after answering the last chunk read. */
+  closeAfterLastRead?: boolean;
 }
 
 export interface FakePage {
@@ -2943,6 +3096,7 @@ export function fakePage(options: FakePageOptions = {}): FakePage {
   const info = options.info ?? { title: "Clip" };
   const store = new Map<string, { main: Uint8Array; aux: Uint8Array }>();
   const page: FakePage = { wrapperTokens: [], readTokens: [], handler: () => {} };
+  let attachCount = 0;
 
   page.handler = (request, connection) => {
     switch (request.method) {
@@ -2950,10 +3104,13 @@ export function fakePage(options: FakePageOptions = {}): FakePage {
         reply(connection, request, { targetInfos: options.targets ?? DEFAULT_TARGETS });
         return;
       case "Target.attachToTarget":
-        reply(connection, request, { sessionId: `session-${String(request.params.targetId)}` });
+        // A fresh session per attach, like a real browser.
+        attachCount++;
+        reply(connection, request, { sessionId: `session-${String(request.params.targetId)}-${attachCount}` });
         return;
       case "Target.detachFromTarget":
         reply(connection, request, {});
+        connection.send({ method: "Target.detachedFromTarget", params: { sessionId: request.params.sessionId } });
         return;
       case "Runtime.evaluate":
         break;
@@ -3007,6 +3164,13 @@ export function fakePage(options: FakePageOptions = {}): FakePage {
       reply(connection, request, {
         result: { type: "string", value: encodeBase64(entry[name].subarray(offset, offset + length)) },
       });
+      const isLastRead = name === "aux"
+        ? offset + length >= aux.length
+        : (aux.length === 0 && offset + length >= main.length);
+      if (isLastRead && options.detachAfterLastRead) {
+        connection.send({ method: "Target.detachedFromTarget", params: { sessionId: request.sessionId } });
+      }
+      if (isLastRead && options.closeAfterLastRead) connection.close();
       return;
     }
     reply(connection, request, { result: { type: "undefined" } });
@@ -3091,6 +3255,54 @@ Deno.test({
     const h = await harness({ wrapperException: "boom" });
     try {
       await assertRejects(() => extractFromTab(h.client, "T1", h.dir, () => {}), ExtractError, "boom");
+    } finally {
+      await h.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "extractFromTab keeps a multi-line page exception and drops stack frames",
+  ...opts,
+  fn: async () => {
+    const h = await harness({ wrapperException: "line one\nline two" });
+    try {
+      const error = await assertRejects(() => extractFromTab(h.client, "T1", h.dir, () => {}), ExtractError);
+      assertEquals((error as Error).message, "Error: line one\nline two");
+    } finally {
+      await h.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "extractFromTab fails when the tab detaches after the last chunk",
+  ...opts,
+  fn: async () => {
+    const h = await harness({ detachAfterLastRead: true });
+    try {
+      await assertRejects(
+        () => extractFromTab(h.client, "T1", h.dir, () => {}),
+        ExtractError,
+        "分頁已關閉或已中斷偵錯連線",
+      );
+    } finally {
+      await h.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "extractFromTab fails when the connection drops after the last chunk",
+  ...opts,
+  fn: async () => {
+    const h = await harness({ closeAfterLastRead: true });
+    try {
+      await assertRejects(
+        () => extractFromTab(h.client, "T1", h.dir, () => {}),
+        ExtractError,
+        "與瀏覽器的連線已中斷",
+      );
     } finally {
       await h.dispose();
     }
@@ -3247,7 +3459,7 @@ export function extractFromTab(
 - [ ] **Step 4: Run test to verify it fails**
 
 Run: `deno task test tests/extract_test.ts`
-Expected: 8 tests FAIL — the success test with `not implemented`, the others because the rejection is an `Error`, not an `ExtractError` with the expected message.
+Expected: 11 tests FAIL — the success test with `not implemented`, the others because the rejection is an `Error`, not an `ExtractError` with the expected message.
 
 - [ ] **Step 5: Implement** — replace the `src/extract.ts` import block with:
 
@@ -3298,7 +3510,10 @@ async function evaluate(
   const details = response.exceptionDetails;
   if (details) {
     const raw = details.exception?.description ?? details.text ?? "頁面腳本發生錯誤";
-    throw new PageException(raw.split("\n")[0].replace(/^(Uncaught )?\w*Error: /, ""));
+    // Keep the whole description (multi-line messages included); drop only
+    // the stack-frame lines.
+    const message = raw.split("\n").filter((line) => !/^\s+at /.test(line)).join("\n").trim();
+    throw new PageException(message || raw);
   }
   return response.result?.value;
 }
@@ -3327,7 +3542,7 @@ function toExtractError(error: unknown, detached: boolean): ExtractError {
   return new ExtractError(error instanceof Error ? error.message : String(error));
 }
 
-/** Spec §6.6: attach, liveness check, run the wrapper, pull both files in 4 MiB chunks. */
+/** Attach, liveness check, run the wrapper, pull both files in 4 MiB chunks. */
 export async function extractFromTab(
   client: CdpClient,
   targetId: string,
@@ -3341,8 +3556,12 @@ export async function extractFromTab(
     throw toExtractError(error, false);
   }
   let detached = false;
+  let connectionLost = false;
   const stopListening = client.on("Target.detachedFromTarget", (params) => {
     if ((params as { sessionId?: string } | undefined)?.sessionId === sessionId) detached = true;
+  });
+  void client.closed.then(() => {
+    connectionLost = true;
   });
   try {
     try {
@@ -3383,7 +3602,7 @@ export async function extractFromTab(
               READ_TIMEOUT_MS,
             );
           } catch (error) {
-            if (error instanceof PageException && error.message === MISSING_DATA) {
+            if (error instanceof PageException && error.message.includes(MISSING_DATA)) {
               throw new ExtractError("頁面資料遺失，分頁可能已重新載入");
             }
             throw error;
@@ -3400,12 +3619,15 @@ export async function extractFromTab(
       }
       if ((await Deno.stat(path)).size !== size) throw new ExtractError(`${name} 檔案大小不符`);
     }
+    // An interruption during the final local writes must still fail the job.
+    if (detached) throw new ExtractError("分頁已關閉或已中斷偵錯連線");
+    if (connectionLost) throw new ExtractError("與瀏覽器的連線已中斷");
     return { info: head.info, mainPath, auxPath, mainSize: head.sizes.main, auxSize: head.sizes.aux };
   } catch (error) {
     throw toExtractError(error, detached);
   } finally {
     stopListening();
-    // No page-side cleanup by design (spec §10); only detach, bounded to 3 s.
+    // No page-side cleanup by design; only detach, bounded to 3 s.
     if (!detached) {
       await client.send("Target.detachFromTarget", { sessionId }, undefined, { timeoutMs: DETACH_TIMEOUT_MS })
         .catch(() => {});
@@ -3417,7 +3639,7 @@ export async function extractFromTab(
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `deno task test tests/extract_test.ts tests/extract_expressions_test.ts`
-Expected: `ok | 17 passed | 0 failed`.
+Expected: `ok | 20 passed | 0 failed`.
 
 - [ ] **Step 7: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -3614,7 +3836,7 @@ export function errorMessage(error: unknown): string {
 
 /**
  * Owns the single browser connection, the single job's state machine, its
- * temp files, ffmpeg children and the shutdown protocol (spec §6.9, §6.11).
+ * temp files, ffmpeg children and the shutdown protocol.
  */
 export class JobManager {
   #settings: Settings;
@@ -3888,7 +4110,7 @@ Deno.test({
     try {
       f.job.extract("T1");
       const status = await waitForState(f.job, ["failed"]);
-      assertEquals(status, { state: "failed", stage: "extract", message: "boom" });
+      assertEquals(status, { state: "failed", stage: "extract", message: "Error: boom" });
       assertEquals(await newSessionTempDirs(before), []);
       f.job.extract("T1"); // allowed straight from failed
       await waitForState(f.job, ["failed"]);
@@ -3979,7 +4201,7 @@ Replace the three skeleton methods with:
     }
     const client = this.#client;
     if (!client) throw new Error(NOT_CONNECTED_MESSAGE);
-    // Synchronous state switch: overlapping calls see "extracting" (spec §6.9).
+    // Synchronous state switch: overlapping calls see "extracting".
     this.#status = { state: "extracting", received: 0, total: 0 };
     this.#track(this.#runExtract(client, targetId));
   }
@@ -4050,7 +4272,7 @@ Replace the three skeleton methods with:
     return dir;
   }
 
-  /** Returns a cleanup warning instead of throwing (spec §6.9). */
+  /** Returns a cleanup warning instead of throwing. */
   async #removeTempDir(dir: string): Promise<string | undefined> {
     try {
       await Deno.remove(dir, { recursive: true });
@@ -4090,7 +4312,7 @@ Expected: `ok | 11 passed | 0 failed`.
 
 ```ts
 import { assert, assertEquals, assertRejects, assertStringIncludes, assertThrows } from "@std/assert";
-import { join } from "@std/path";
+import { isAbsolute, join } from "@std/path";
 import { activeChildCount } from "../src/ffmpeg.ts";
 import { BUSY_MESSAGE } from "../src/job.ts";
 import type { Settings } from "../src/types.ts";
@@ -4121,6 +4343,10 @@ const VIDEO: Uint8Array = FFMPEG
 
 const base = { sanitizeOps: false, sanitizeResources: false, ignore: !FFMPEG };
 
+// Fake tool scripts for this file live in one dir, removed when the module unloads.
+const TOOL_DIR = await makeTempDir();
+globalThis.addEventListener("unload", () => Deno.removeSync(TOOL_DIR, { recursive: true }));
+
 async function videoJob(overrides: Partial<Settings> = {}): Promise<{ f: JobFixture; tempDir: string }> {
   const before = await sessionTempDirs();
   const f = await readyJob({ main: VIDEO, aux: new Uint8Array([1]) }, overrides);
@@ -4129,12 +4355,22 @@ async function videoJob(overrides: Partial<Settings> = {}): Promise<{ f: JobFixt
 }
 
 /** Scripts that stand in for ffmpeg; they receive the real argument list (output path last). */
-async function fakeTools(dir: string) {
+async function fakeTools() {
+  const dir = TOOL_DIR;
   return {
     hang: await makeExecutable(dir, "hang", "exec sleep 30"),
     slowWriter: await makeExecutable(dir, "slow-writer", 'for last; do :; done\nsleep 1\nprintf fake > "$last"'),
     failing: await makeExecutable(dir, "failing", 'echo "boom from ffmpeg" >&2\nexit 3'),
     silent: await makeExecutable(dir, "silent", "exit 0"),
+    /** Real ffmpeg slowed to real time, so a job stays in "running" for ~3 s. */
+    realtime: await makeExecutable(dir, "realtime-ffmpeg", 'exec ffmpeg -re "$@"'),
+    /** Ignores SIGTERM, writes its output and exits 0 about 1 s later. */
+    stubbornWriter: (ready: string) =>
+      makeExecutable(
+        dir,
+        "stubborn-writer",
+        `trap '' TERM\ntouch "${ready}"\nfor last; do :; done\nsleep 1\nprintf fake > "$last"\nexit 0`,
+      ),
     marker: (path: string) => makeExecutable(dir, "marker", `touch "${path}"\nexit 1`),
   };
 }
@@ -4304,7 +4540,7 @@ Deno.test({
   name: "a publish failure returns to ready, drops out/, and a retry succeeds",
   ...base,
   fn: async () => {
-    const tools = await fakeTools(await makeTempDir());
+    const tools = await fakeTools();
     const { f, tempDir } = await videoJob({ ffmpegPath: tools.slowWriter });
     try {
       await f.job.startProcess("pub.mp4", null);
@@ -4326,17 +4562,17 @@ Deno.test({
 });
 
 Deno.test({
-  name: "cancel while running stops ffmpeg and leaves no output",
+  name: "cancel while running stops a real ffmpeg and leaves no output",
   ...base,
   fn: async () => {
-    const tools = await fakeTools(await makeTempDir());
-    const { f, tempDir } = await videoJob({ ffmpegPath: tools.hang });
+    const tools = await fakeTools();
+    const { f, tempDir } = await videoJob({ ffmpegPath: tools.realtime });
     try {
       await f.job.startProcess("c.mp4", null);
       await waitFor(() => {
         const s = f.job.getStatus();
-        return s.state === "processing" && s.phase === "running";
-      }, "running phase");
+        return s.state === "processing" && s.phase === "running" && (s.message ?? "").startsWith("frame=");
+      }, "real ffmpeg reporting progress");
       f.job.cancel();
       assertEquals(await waitForState(f.job, ["cancelled"]), { state: "cancelled" });
       assertEquals(await pathExists(tempDir), false);
@@ -4352,9 +4588,8 @@ Deno.test({
   name: "cancel while preparing never starts ffmpeg",
   ...base,
   fn: async () => {
-    const toolDir = await makeTempDir();
-    const tools = await fakeTools(toolDir);
-    const markerPath = join(toolDir, "ffmpeg-ran");
+    const tools = await fakeTools();
+    const markerPath = join(TOOL_DIR, "ffmpeg-ran-preparing");
     const { f } = await videoJob({ ffprobePath: tools.hang, ffmpegPath: await tools.marker(markerPath) });
     try {
       await f.job.startProcess("p.mp4", null);
@@ -4395,7 +4630,7 @@ Deno.test({
   name: "a non-zero ffmpeg exit fails with the stderr tail",
   ...base,
   fn: async () => {
-    const tools = await fakeTools(await makeTempDir());
+    const tools = await fakeTools();
     const { f, tempDir } = await videoJob({ ffmpegPath: tools.failing });
     try {
       await f.job.startProcess("x.mp4", null);
@@ -4415,7 +4650,7 @@ Deno.test({
   name: "ffmpeg exiting 0 without output fails with a hint",
   ...base,
   fn: async () => {
-    const tools = await fakeTools(await makeTempDir());
+    const tools = await fakeTools();
     const { f } = await videoJob({ ffmpegPath: tools.silent });
     try {
       await f.job.startProcess("x.mp4", null);
@@ -4432,7 +4667,7 @@ Deno.test({
   name: "only the first of overlapping startProcess calls wins and discard is refused",
   ...base,
   fn: async () => {
-    const tools = await fakeTools(await makeTempDir());
+    const tools = await fakeTools();
     const { f } = await videoJob({ ffmpegPath: tools.hang });
     try {
       const results = await Promise.allSettled([
@@ -4447,6 +4682,50 @@ Deno.test({
       await waitForState(f.job, ["cancelled"]);
       assertThrows(() => f.job.cancel(), Error, "目前沒有進行中的處理");
     } finally {
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "cancel that lands while ffmpeg is finishing still prevents publishing",
+  ...base,
+  fn: async () => {
+    const tools = await fakeTools();
+    const ready = join(TOOL_DIR, "stubborn-writer-ready");
+    await Deno.remove(ready).catch(() => {});
+    const { f, tempDir } = await videoJob({ ffmpegPath: await tools.stubbornWriter(ready) });
+    try {
+      await f.job.startProcess("late.mp4", null);
+      await waitFor(() => pathExists(ready), "writer started");
+      // SIGTERM is ignored: the writer still produces its output and exits 0.
+      f.job.cancel();
+      assertEquals(await waitForState(f.job, ["cancelled", "done", "failed"]), { state: "cancelled" });
+      assertEquals(await listDir(f.outputDir), []);
+      assertEquals(await pathExists(tempDir), false);
+    } finally {
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "a relative outputDir is resolved to an absolute path at startProcess",
+  ...base,
+  fn: async () => {
+    const { f } = await videoJob();
+    const previousCwd = Deno.cwd();
+    Deno.chdir(f.workDir);
+    try {
+      f.job.updateSettings({ ...f.settings, outputDir: "relative-out" });
+      const { finalPath } = await f.job.startProcess("rel.mp4", null);
+      assert(isAbsolute(finalPath), finalPath);
+      assertEquals(finalPath, join(Deno.cwd(), "relative-out", "rel.mp4"));
+      const status = await waitForState(f.job, ["done", "failed"]);
+      assertEquals(status, { state: "done", outputPath: finalPath });
+      assert(await pathExists(finalPath));
+    } finally {
+      Deno.chdir(previousCwd);
       await f.dispose();
     }
   },
@@ -4471,14 +4750,14 @@ Deno.test({
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: 15 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`).
+Expected: 17 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`).
 
 - [ ] **Step 4: Implement** — in `src/job.ts`:
 
 Replace the import block with:
 
 ```ts
-import { join } from "@std/path";
+import { join, resolve } from "@std/path";
 import { browserWsUrl } from "./cdp/address.ts";
 import { CdpClient, CdpClosedError } from "./cdp/client.ts";
 import { extractFromTab } from "./extract.ts";
@@ -4530,7 +4809,7 @@ Replace the two skeleton methods with:
 
 ```ts
   /**
-   * Spec §6.9 startProcess. Everything before the first await is synchronous
+   * Everything before the first await is synchronous
    * (state switch + settings snapshot). Resolves once the destination checks
    * are done; processing then continues in the background.
    */
@@ -4543,7 +4822,9 @@ Replace the two skeleton methods with:
       throw new Error(BUSY_MESSAGE);
     }
     const name = sanitizeFilename(filename);
-    const settings = { ...this.#settings };
+    // Snapshot with an absolute output dir: confirmation, publishing and the
+    // result all use this exact path even if settings or cwd change later.
+    const settings = { ...this.#settings, outputDir: resolve(this.#settings.outputDir) };
     const ctx: ProcessContext = {
       settings,
       name,
@@ -4593,8 +4874,10 @@ Replace the two skeleton methods with:
     try {
       try {
         await Deno.mkdir(ctx.settings.outputDir, { recursive: true });
+        if (this.#cancelRequested) return;
         const exists = await pathExists(ctx.finalPath);
-        if (exists && ctx.confirmedOverwritePath !== ctx.finalPath && !this.#cancelRequested) {
+        if (this.#cancelRequested) return;
+        if (exists && ctx.confirmedOverwritePath !== ctx.finalPath) {
           cleanup = "keep-all";
           next = ctx.readyStatus;
           return;
@@ -4654,7 +4937,10 @@ Replace the two skeleton methods with:
         };
         return;
       }
-      if (!(await pathExists(tempOutput))) {
+      const produced = await pathExists(tempOutput);
+      // Cancellation (user or shutdown) during the check must still win.
+      if (this.#cancelRequested) return;
+      if (!produced) {
         next = {
           state: "failed",
           stage: "process",
@@ -4701,7 +4987,7 @@ Replace the two skeleton methods with:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: `ok | 15 passed | 0 failed`.
+Expected: `ok | 17 passed | 0 failed`.
 
 - [ ] **Step 6: Run the whole suite** — `deno task test` → all tests pass.
 
@@ -4837,22 +5123,27 @@ Deno.test({
 });
 
 Deno.test({
-  name: "shutdown while running cancels ffmpeg",
+  name: "shutdown while a real ffmpeg is running cancels it and cleans up",
   ...opts,
   ignore: !FFMPEG,
   fn: async () => {
     const toolDir = await makeTempDir();
-    const hang = await makeExecutable(toolDir, "hang", "exec sleep 30");
-    const f = await readyJob({ main: VIDEO }, { ffmpegPath: hang });
+    // Real ffmpeg slowed to real time so the job is still running at shutdown.
+    const realtime = await makeExecutable(toolDir, "realtime-ffmpeg", 'exec ffmpeg -re "$@"');
+    const before = await sessionTempDirs();
+    const f = await readyJob({ main: VIDEO }, { ffmpegPath: realtime });
     try {
+      const [tempDir] = await newSessionTempDirs(before);
       await f.job.startProcess("r.mp4", null);
       await waitFor(() => {
         const s = f.job.getStatus();
-        return s.state === "processing" && s.phase === "running";
-      }, "running phase");
+        return s.state === "processing" && s.phase === "running" && (s.message ?? "").startsWith("frame=");
+      }, "real ffmpeg reporting progress");
       await f.job.shutdown();
       assertEquals(f.job.getStatus(), { state: "cancelled" });
       assertEquals(activeChildCount(), 0);
+      assertEquals(await pathExists(tempDir), false);
+      assertEquals(await listDir(f.outputDir), []);
     } finally {
       await f.dispose();
       await Deno.remove(toolDir, { recursive: true });
@@ -4914,18 +5205,28 @@ Deno.test({
 });
 
 Deno.test({
-  name: "abortSync kills children and removes the temp dir synchronously",
+  name: "abortSync kills running children and removes the temp dir synchronously",
   ...opts,
+  ignore: !FFMPEG,
   fn: async () => {
+    const toolDir = await makeTempDir();
+    const hang = await makeExecutable(toolDir, "hang", "exec sleep 30");
     const before = await sessionTempDirs();
-    const f = await readyJob();
+    const f = await readyJob({ main: VIDEO }, { ffmpegPath: hang });
     try {
       const [tempDir] = await newSessionTempDirs(before);
+      await f.job.startProcess("a.mp4", null);
+      await waitFor(() => {
+        const s = f.job.getStatus();
+        return s.state === "processing" && s.phase === "running" && activeChildCount() === 1;
+      }, "ffmpeg running");
       f.job.abortSync();
+      // The directory is gone as soon as abortSync returns.
       assertEquals(await pathExists(tempDir), false);
-      assertEquals(activeChildCount(), 0);
+      await waitFor(() => activeChildCount() === 0, "child killed", 3000);
     } finally {
       await f.dispose();
+      await Deno.remove(toolDir, { recursive: true });
     }
   },
 });
@@ -4966,7 +5267,7 @@ Replace the two skeleton methods with:
 
 ```ts
   /**
-   * Graceful shutdown for the Cmd+Q path (spec §6.11 A). Blocks new
+   * Graceful shutdown for the Cmd+Q path. Blocks new
    * state-changing calls, winds down the current job, closes the CDP
    * connection, and always ends with killAllChildren() because Deno.exit()
    * does not terminate child processes.
@@ -4985,12 +5286,15 @@ Replace the two skeleton methods with:
         this.#client?.close(); // Pending CDP requests reject immediately.
       } else if (status.state === "processing" && status.phase !== "publishing") {
         this.cancel();
-      } else if (status.state === "ready") {
-        const dir = this.#detachReadyFiles();
-        if (dir) await Deno.remove(dir, { recursive: true }).catch(() => {});
       }
       // Publishing is awaited, never interrupted.
       await this.#work?.catch(() => {});
+      // Ready-state files are cleaned after the work settles: the job may have
+      // been ready from the start, or returned to ready after a publish failure.
+      if (this.#status.state === "ready") {
+        const dir = this.#detachReadyFiles();
+        if (dir) await Deno.remove(dir, { recursive: true }).catch(() => {});
+      }
       await this.#connecting?.catch(() => {});
       this.#client?.close();
       this.#client = null;
@@ -5005,7 +5309,7 @@ Replace the two skeleton methods with:
   }
 
   /**
-   * Close-button path (spec §6.11 B): the process dies right after the close
+   * Close-button path: the process dies right after the close
    * event, so only synchronous, best-effort cleanup is possible.
    */
   abortSync(): void {
@@ -5204,6 +5508,7 @@ Expected: 4 tests FAIL — content type is `text/plain;charset=UTF-8`, the unkno
         <progress id="process-progress" max="100"></progress>
         <p id="process-detail"></p>
         <p id="process-message" class="mono ellipsis"></p>
+        <p id="process-error" class="error" hidden></p>
         <p class="warning">關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束</p>
         <div class="actions">
           <button id="cancel-button" type="button">取消</button>
@@ -5215,6 +5520,7 @@ Expected: 4 tests FAIL — content type is `text/plain;charset=UTF-8`, the unkno
         <p id="result-message"></p>
         <pre id="result-detail" class="mono" hidden></pre>
         <p id="result-cleanup" class="warning" hidden></p>
+        <p id="result-error" class="error" hidden></p>
         <div class="actions">
           <button id="reveal-button" type="button" hidden>在 Finder 中顯示</button>
           <button id="again-button" type="button" class="primary">再一次</button>
@@ -5540,6 +5846,8 @@ async function refresh() {
   ui.polling = true;
   try {
     const [status, connection] = await Promise.all([bindings.getStatus(), bindings.getConnection()]);
+    // Shutdown may have started while the request was in flight.
+    if (ui.shuttingDown) return;
     ui.connected = connection.connected;
     render(status);
   } catch (error) {
@@ -5549,7 +5857,7 @@ async function refresh() {
   }
 }
 
-// Screen = f(job state, connected); the job state wins (spec §6.12).
+// Screen = f(job state, connected); the job state wins.
 function render(status) {
   switch (status.state) {
     case "extracting":
@@ -5565,6 +5873,7 @@ function render(status) {
       break;
     case "processing":
       stopProbing();
+      if (ui.screen !== "processing") showError("process-error", null);
       showScreen("processing");
       renderProcessing(status);
       startPolling();
@@ -5675,8 +5984,8 @@ async function startExtract(targetId) {
     await bindings.extract(targetId);
   } catch (error) {
     showError("tabs-error", error);
-    return;
   }
+  // Also after a failure: a dropped connection must lead back to the connect screen.
   await refresh();
 }
 
@@ -5784,10 +6093,11 @@ function renderProcessing(status) {
 }
 
 async function cancelProcessing() {
+  showError("process-error", null);
   try {
     await bindings.cancel();
   } catch (error) {
-    console.error(error);
+    showError("process-error", error);
   }
   await refresh();
 }
@@ -5795,6 +6105,7 @@ async function cancelProcessing() {
 // ---- 6. result ----
 
 function renderResult(status) {
+  if (ui.screen !== "result") showError("result-error", null);
   showScreen("result");
   const detail = $("result-detail");
   detail.hidden = true;
@@ -5822,20 +6133,22 @@ function renderResult(status) {
 }
 
 async function again() {
+  showError("result-error", null);
   try {
     await bindings.reset();
   } catch (error) {
-    console.error(error);
+    showError("result-error", error);
   }
   await refresh();
 }
 
 async function reveal() {
   if (ui.resultPath === null) return;
+  showError("result-error", null);
   try {
     await bindings.revealInFinder(ui.resultPath);
   } catch (error) {
-    console.error(error);
+    showError("result-error", error);
   }
 }
 
@@ -5893,6 +6206,9 @@ globalThis.__showShuttingDown = () => {
   ui.shuttingDown = true;
   stopPolling();
   stopProbing();
+  // A modal dialog sits in the top layer above the overlay, so close it first.
+  const dialog = $("settings-dialog");
+  if (dialog.open) dialog.close();
   setHidden("shutdown-overlay", false);
 };
 
@@ -5931,7 +6247,7 @@ Expected: the two consistency tests (element ids, bindings) now PASS; the two `s
 - [ ] **Step 8: Implement** — replace `serveUi` in `src/ui-assets.ts`
 
 ```ts
-/** Spec §6.10: `/`, `/app.js`, `/style.css`; everything else is 404. */
+/** Serves `/`, `/app.js`, `/style.css`; everything else is 404. */
 export function serveUi(request: Request): Response {
   const asset = UI_ASSETS[new URL(request.url).pathname];
   if (!asset) return new Response("Not Found", { status: 404 });
@@ -6036,7 +6352,7 @@ win.bind("revealInFinder", async (path: string) => {
 });
 
 // A custom quit item instead of role "quit": the OS handles role items
-// without telling JS, which would skip the graceful shutdown (spec §6.10).
+// without telling JS, which would skip the graceful shutdown.
 win.setApplicationMenu([
   {
     submenu: {
@@ -6062,10 +6378,13 @@ win.setApplicationMenu([
 let quitting = false;
 let shutdownDone = false;
 
-/** Spec §6.11 A: Cmd+Q / menu quit. */
+/** Graceful quit for Cmd+Q / the menu quit item. */
 async function requestShutdown(): Promise<void> {
   if (quitting) return;
   quitting = true;
+  // Start shutdown before any await so state-changing bindings are refused
+  // immediately; the overlay is shown while it runs.
+  const shutdown = job.shutdown({ deadlineMs: 10_000 });
   let overlayTimer: number | undefined;
   await Promise.race([
     win.executeJs("window.__showShuttingDown?.()").catch(() => null),
@@ -6074,7 +6393,7 @@ async function requestShutdown(): Promise<void> {
     }),
   ]);
   clearTimeout(overlayTimer);
-  await job.shutdown({ deadlineMs: 10_000 });
+  await shutdown;
   shutdownDone = true;
   win.close();
   Deno.exit(0);
@@ -6084,7 +6403,7 @@ win.addEventListener("menuclick", (event) => {
   if (event.detail.id === "quit") void requestShutdown();
 });
 
-// Spec §6.11 B: the close event cannot be cancelled in Deno 2.9.7 and the
+// The close event cannot be cancelled in Deno 2.9.7 and the
 // process dies right after it, so only synchronous cleanup runs here.
 win.addEventListener("close", () => {
   if (shutdownDone) return;
@@ -6093,7 +6412,7 @@ win.addEventListener("close", () => {
 
 Deno.serve(serveUi);
 
-// Best-effort cleanup of earlier runs; never blocks the UI (spec §6.9).
+// Best-effort cleanup of earlier runs; never blocks the UI.
 void systemTempRoot()
   .then((root) => cleanupStaleArtifacts(root, settings.outputDir))
   .catch((error) => console.warn(`[tab-ripper] startup cleanup skipped: ${String(error)}`));
@@ -6125,7 +6444,7 @@ Expected: ends with `Bundle dist/TabRipper.app`; `ls -d dist/TabRipper.app` prin
 
 The automated suite cannot drive the desktop window or the real browser (spec §9 manual list). The user performs the UI actions; the implementer runs commands, reads logs and records results.
 
-- [ ] **Step 1: Install the temporary acceptance configuration** — overwrite these files (they are restored in Step 4):
+- [ ] **Step 1: Back up and install the temporary acceptance configuration** — first back up the current files (they may contain the user's own work): `mkdir -p "$TMPDIR/tab-ripper-user-backup" && cp user/config.ts user/page-script.js user/info.ts user/ffmpeg-args.ts "$TMPDIR/tab-ripper-user-backup/"`. Then overwrite these files (restored in Step 4):
 
 `user/config.ts`:
 
@@ -6200,18 +6519,21 @@ Then run `deno task build`.
 
 - [ ] **Step 2: Walk the user through spec §9 manual checklist** with `open dist/TabRipper.app`, recording PASS/FAIL for each:
   1. Remote debugging toggle OFF in Brave → connect screen shows the `chrome://inspect/#remote-debugging` guidance; turning it ON switches to "偵測到" within 2 s and Brave shows **no** permission dialog.
-  2. Click 連線 → exactly one Brave permission dialog; after Allow the tab list appears. Set 設定 › CDP 位址 to `127.0.0.1:9223` → connect screen shows not detected; set it back → detected again.
+  2. Still on the connect screen (not yet connected): set 設定 › CDP 位址 to `127.0.0.1:9223` → the probe shows not detected; set it back to `127.0.0.1:9222` → detected again. Then click 連線 → exactly one Brave permission dialog; after Allow the tab list appears.
   3. Finish one job, click 再一次 → no new permission dialog.
   4. Start an extraction and close that tab within the script's 5-second delay → "分頁已關閉或已中斷偵錯連線".
   5. Pick a never-opened (dormant) tab → about 3 s later "分頁尚未載入"; open that tab in Brave and retry → success.
   6. During processing click 取消 → no file in the output folder; `ls "$TMPDIR" | grep ffdl-` shows no dir for this job.
-  7. Set `PROBE_DURATION = false` in `user/config.ts`, rebuild, process → indeterminate progress bar with elapsed time; the ffmpeg status line (`frame=`/`size=`…) is shown under the bar. Restore `true` and rebuild.
+  7. Quit the app with Cmd+Q, set `PROBE_DURATION = false` in `user/config.ts`, run `deno task build`, relaunch with `open dist/TabRipper.app`, connect and process → indeterminate progress bar with elapsed time; the ffmpeg status line (`frame=`/`size=`…) is shown under the bar. Quit with Cmd+Q, set it back to `true`, run `deno task build`, relaunch for the remaining items.
   8. During processing press Cmd+Q → "正在結束…" overlay, app quits within a few seconds; `pgrep -fl ffmpeg` shows nothing; `ls "$TMPDIR" | grep ffdl-` shows no dir from this run.
   9. During processing click the window close button → app quits immediately; `pgrep -fl ffmpeg` shows nothing; relaunch the app, then `ls "$TMPDIR" | grep ffdl-` shows the leftover is gone.
   10. All of the above were run from `dist/TabRipper.app` built by `deno task build`.
+  11. During processing, open 設定 and press Cmd+Q while the settings dialog is open → the dialog closes and the full-screen "正在結束…" overlay is visible before the app quits.
+
+  Use a distinct output filename for each item, and before each cancellation/quit check note the job's temp dir (`ls -d "$TMPDIR"/ffdl-*`) so earlier runs do not confuse the cleanup checks.
 
 - [ ] **Step 3: Record results** — report each item's PASS/FAIL with observations to the user. Any FAIL is handled with root-cause analysis before changing code (project rules), then the affected task's tests are extended first.
 
-- [ ] **Step 4: Restore the user files** — `git restore user/config.ts user/page-script.js user/info.ts user/ffmpeg-args.ts`, then `git status --short user/` prints nothing.
+- [ ] **Step 4: Restore the user files** — `cp "$TMPDIR"/tab-ripper-user-backup/* user/`, then `diff -r "$TMPDIR/tab-ripper-user-backup" user/` prints nothing; remove the backup with `rm -r "$TMPDIR/tab-ripper-user-backup"`.
 
 - [ ] **Step 5: Final gate** — `deno task check && deno task lint && deno fmt --check && deno task test && deno task build` all succeed on the restored tree.
