@@ -171,7 +171,7 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 | `ffprobePath` | `ffprobe` | 同上 |
 
 - `loadSettings(): Promise<{ settings: Settings; warning?: string }>`：檔案不存在 → 全部預設值；JSON 損毀 → 預設值並回傳 warning（設定頁顯示）；部分欄位缺漏或型別不符 → 該欄位用預設值。
-- `saveSettings(s: Settings): Promise<void>`：以 §6.3 `parseCdpAddress` 驗證 `cdpAddress`；不合法時丟出錯誤、不寫檔。寫入前確保目錄存在。
+- `saveSettings(s: Settings): Promise<void>`：以 §6.3 `parseCdpAddress` 驗證 `cdpAddress`；不合法時丟出錯誤、不寫檔。寫入前確保目錄存在。CDP 位址變更對既有連線的影響見 §6.9「變更 CDP 位址」。
 
 ### 6.2 `cdp/probe.ts`
 
@@ -332,6 +332,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - 連線成功時若 `shuttingDown` 已為 true，立即關閉該 client 並以「程式正在結束」失敗。
 - `client.closed` 的處理函式綁定該 client 實例：只有在 `this.client === 該 client` 時才把 `client` 設為 null，避免舊連線的關閉事件誤把新連線標成中斷。
 - 連線關閉時，若當下為 extracting，該次擷取以失敗結束。
+- **變更 CDP 位址**：儲存設定時若 `cdpAddress` 與目前不同：
+  - 工作為 extracting 時拒絕儲存，錯誤「擷取中無法變更 CDP 位址」（設定檔與記憶體中的設定都不變）。
+  - 其他狀態下，先通過檢查、寫入設定檔，再套用到 JobManager；套用時關閉現有的瀏覽器連線（`connected` 變 false），並讓進行中的連線嘗試失效——該嘗試完成時發現位址已不同，就關閉該 client 並以「CDP 位址已變更，請重新連線」失敗。ready / processing / 結果畫面不受影響（§6.12），工作回到 idle 後顯示連線畫面，使用者以新位址重新連線。
+  - 位址未變更時，連線維持不變。
 
 ### 6.10 `main.ts` 與 bindings
 
@@ -411,7 +415,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
    - 已開啟：顯示「偵測到瀏覽器偵錯埠」與「連線」按鈕；按下才呼叫 `connect()`，並提示「請在瀏覽器跳出的對話框按允許」。連線失敗顯示錯誤訊息並留在此畫面。
 2. **分頁清單**：`listTabs()` 結果（標題、URL），可「重新整理」；無符合分頁時顯示空狀態與目前的 `URL_PATTERN`。點選分頁 → `extract()`。
 3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組，並顯示提示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」（§6.11 B）。
-4. **預覽**：`lastError` 存在時在頂端顯示錯誤橫幅（例如「輸出失敗：磁碟空間不足，可修改檔名或到設定更換輸出資料夾後重試」）；info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`（從目的地失敗回來時保留使用者上次輸入的檔名）；「開始處理」與「取消」（`discard()`）。第一次以 `startProcess(filename, null)` 呼叫；回傳 `needsConfirm` 時以原生 `confirm()` 顯示 `finalPath` 詢問是否覆蓋，同意則以 `startProcess(filename, finalPath)` 重呼叫。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
+4. **預覽**：`lastError` 存在時在頂端顯示錯誤橫幅（例如「輸出失敗：磁碟空間不足，可修改檔名或到設定更換輸出資料夾後重試」）；info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`（從目的地失敗回來時保留使用者上次輸入的檔名）；「開始處理」與「取消」（`discard()`）。第一次以 `startProcess(filename, null)` 呼叫；回傳 `needsConfirm` 時以原生 `confirm()` 顯示 `finalPath` 詢問是否覆蓋，同意則以 `startProcess(filename, finalPath)` 重呼叫。按下「開始處理」後 UI **立即開始輪詢** `getStatus()`，不等 `startProcess` 回傳：準備階段（建立資料夾、檢查目的地）期間畫面即切到「處理中／準備中」並可按「取消」；若最後回傳 `needsConfirm` 或目的地失敗，輪詢會看到 ready 而回到預覽。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
 5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；進度條下方以等寬字型單行顯示 `message`（ffmpeg 輸出的最後一行，過長時以省略號截斷、滑鼠移上顯示全文）；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。同樣顯示「關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束」提示。
 6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。有 `cleanupWarning` 時額外顯示「暫存檔未能刪除：<路徑>」提醒。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
@@ -458,7 +462,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、以 `-re` 實速執行時至少收到一次以 `frame=` 開頭的 `message` 且 `stderrTail` 中沒有 transient 的狀態行、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、目的地失敗（`outputDir` 指向一個無法建立的路徑，例如其上層是一般檔案；檔名超過 255 位元組導致存在檢查丟出非 NotFound 錯誤；發佈時目標資料夾已被移除寫入權限）時狀態回到 ready 並帶 `lastError`、main/aux 保留、`<tempDir>/out/` 已刪除，之後把 `outputDir` 改成可寫入的資料夾再呼叫 `startProcess` 能成功完成、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
-- **連線管理**：以延遲回應 WebSocket upgrade 的假 CDP server 模擬「等待授權」：重疊呼叫兩次 `connect()` 時 server 只收到一次連線；連線等待中呼叫 `shutdown()`，連線完成後立即被關閉、`connect()` 以「程式正在結束」失敗；連線中斷後重新連線，新連線不會被舊連線之後才發生的事件標成中斷（透過公開 API 無法讓舊 client 的 `closed` 處理在新 client 建立之後才觸發，因為重新連線必須等舊連線被清除；`closed` 處理綁定 client 實例屬於防禦性實作，以「中斷 → 重新連線 → 等待一段時間後仍為已連線」驗證可觀察的行為）。
+- **連線管理**：以延遲回應 WebSocket upgrade 的假 CDP server 模擬「等待授權」：重疊呼叫兩次 `connect()` 時 server 只收到一次連線；連線等待中呼叫 `shutdown()`，連線完成後立即被關閉、`connect()` 以「程式正在結束」失敗；連線中斷後重新連線，新連線不會被舊連線之後才發生的事件標成中斷（透過公開 API 無法讓舊 client 的 `closed` 處理在新 client 建立之後才觸發，因為重新連線必須等舊連線被清除；`closed` 處理綁定 client 實例屬於防禦性實作，以「中斷 → 重新連線 → 等待一段時間後仍為已連線」驗證可觀察的行為）；變更 CDP 位址：已連線時套用新位址會關閉舊連線；連線嘗試進行中套用新位址，該嘗試完成後被關閉並以「CDP 位址已變更，請重新連線」失敗；extracting 時變更位址被拒絕且設定不變；位址不變的設定更新不影響連線。
 - **啟動殘留清理**：在測試建立的暫存位置放入其他 session 的 `ffdl-<別的id>-*` 目錄與 `.ffdl-<別的id>-abc.part` 檔，以及帶目前 `sessionId` 的目錄與 `.part` 檔，驗證只有前者被刪除、後者與其他檔案不受影響；`outputDir` 不存在、以及 `outputDir` 被移除讀取權限時，清理函式正常 resolve、不丟錯，且暫存目錄部分仍完成清理。
 - **工具檢查逾時**：以 `-version` 永不結束的假執行檔腳本呼叫 `checkTool`（縮短 `timeoutMs`），驗證回傳 `ok: false`、子行程已結束且已從登記集合移除；`killAllChildren()` 能終止登記中的懸置子行程。
 - **ffprobe 逾時**：在 `ffmpeg.ts` 的測試中直接呼叫 `probeDuration`，以永不結束的假 ffprobe 腳本與縮短的 `timeoutMs` 驗證回傳 `null` 且子行程已結束；`signal` 中止時同樣驗證。
@@ -494,6 +498,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
   - Concern：擷取完成（或失敗、逾時後腳本才完成）時，`window.__ffdl[token]` 中的 main/aux buffer（各可能數十 MB）會留在分頁記憶體中；同一分頁多次擷取會累積。
   - Decision：不清理（不送 delete 運算式、不使用取消標記）。
   - Rationale：使用者裁決；通常每個網頁只擷取一次，即使累積，重新整理分頁即可釋放，不值得為此維護清理與取消標記的生命週期。
+- **目的地 I/O 卡住**
+  - Concern：輸出資料夾位於外接或網路磁碟且建立資料夾、檢查目的地的檔案操作卡住不回應時，工作會一直停在「準備中」，取消也要等該 I/O 回應後才會完成。
+  - Decision：不為這些檔案操作加上逾時與放棄機制。
+  - Rationale：使用者裁決；屬罕見環境問題，使用者仍可用 Cmd+Q 結束（結束流程有 10 秒硬性期限，§6.11），成本與風險不成比例。
 - **wrapper script 的子孫行程**
   - Concern：`ffmpegPath` / `ffprobePath` 若設成 wrapper script，且 script 不是以 `exec` 啟動真正的工具，取消、逾時與結束流程只會終止 script 本身；子孫行程可能存活並持有 stdout/stderr，使讀取等不到 EOF。
   - Decision：不實作行程群組（process tree）終止與串流讀取逾時。
