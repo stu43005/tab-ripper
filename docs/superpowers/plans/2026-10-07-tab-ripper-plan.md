@@ -634,9 +634,9 @@ Expected: `ok | 6 passed | 0 failed`.
 - [ ] **Step 1: Write the failing test** — `tests/settings_test.ts`
 
 ```ts
-import { assertEquals, assertExists, assertRejects } from "@std/assert";
+import { assertEquals, assertExists, assertRejects, assertThrows } from "@std/assert";
 import { dirname, join } from "@std/path";
-import { defaultSettings, loadSettings, saveSettings, settingsPath } from "../src/settings.ts";
+import { defaultSettings, loadSettings, saveSettings, settingsPath, validateSettings } from "../src/settings.ts";
 
 async function withHome(fn: (home: string) => Promise<void>): Promise<void> {
   const home = await Deno.makeTempDir({ prefix: "tabripper-home-" });
@@ -728,6 +728,19 @@ Deno.test("saveSettings rejects an invalid CDP address and writes nothing", asyn
   });
 });
 
+Deno.test("validateSettings checks synchronously without touching the disk", async () => {
+  await withHome(async () => {
+    assertThrows(
+      () => validateSettings({ ...defaultSettings(), cdpAddress: "bad" }),
+      Error,
+      "CDP 位址格式應為",
+    );
+    assertThrows(() => validateSettings({ ...defaultSettings(), ffmpegPath: "" }), Error, "設定欄位不可為空");
+    validateSettings(defaultSettings());
+    await assertRejects(() => Deno.stat(settingsPath()), Deno.errors.NotFound);
+  });
+});
+
 Deno.test("saveSettings rejects empty fields", async () => {
   await withHome(async () => {
     await assertRejects(
@@ -756,6 +769,10 @@ export function loadSettings(): Promise<{ settings: Settings; warning?: string }
   return Promise.reject(new Error("not implemented"));
 }
 
+export function validateSettings(_settings: Settings): void {
+  throw new Error("not implemented");
+}
+
 export function saveSettings(_settings: Settings): Promise<void> {
   return Promise.reject(new Error("not implemented"));
 }
@@ -764,7 +781,7 @@ export function saveSettings(_settings: Settings): Promise<void> {
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/settings_test.ts`
-Expected: all 8 tests FAIL (`not implemented`, or message mismatch in the rejection tests).
+Expected: all 9 tests FAIL (`not implemented`, or message mismatch in the rejection tests).
 
 - [ ] **Step 4: Implement** — replace `src/settings.ts`
 
@@ -825,13 +842,18 @@ export async function loadSettings(): Promise<{ settings: Settings; warning?: st
   return { settings };
 }
 
-export async function saveSettings(settings: Settings): Promise<void> {
+/** Synchronous validation, usable before any await (e.g. by the save binding). */
+export function validateSettings(settings: Settings): void {
   for (const key of KEYS) {
     if (typeof settings[key] !== "string" || settings[key].trim() === "") {
       throw new Error("設定欄位不可為空");
     }
   }
   parseCdpAddress(settings.cdpAddress);
+}
+
+export async function saveSettings(settings: Settings): Promise<void> {
+  validateSettings(settings);
   const path = settingsPath();
   await Deno.mkdir(dirname(path), { recursive: true });
   const clean: Settings = {
@@ -847,7 +869,7 @@ export async function saveSettings(settings: Settings): Promise<void> {
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/settings_test.ts`
-Expected: `ok | 8 passed | 0 failed`.
+Expected: `ok | 9 passed | 0 failed`.
 
 - [ ] **Step 6: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -6623,7 +6645,7 @@ import { cleanupStaleArtifacts, systemTempRoot } from "./src/cleanup.ts";
 import { probeCdpPort } from "./src/cdp/probe.ts";
 import { checkTool, killAllChildren } from "./src/ffmpeg.ts";
 import { JobManager, SHUTTING_DOWN_MESSAGE } from "./src/job.ts";
-import { loadSettings, saveSettings } from "./src/settings.ts";
+import { loadSettings, saveSettings, validateSettings } from "./src/settings.ts";
 import type { Settings, ToolCheck } from "./src/types.ts";
 import { serveUi } from "./src/ui-assets.ts";
 
@@ -6669,12 +6691,19 @@ win.bind("saveSettings", async (next: Settings) => {
     ffmpegPath: String(next.ffmpegPath).trim(),
     ffprobePath: String(next.ffprobePath).trim(),
   };
-  // Refuse before touching the file (e.g. a CDP address change while extracting).
-  job.assertSettingsChangeAllowed(candidate);
-  await saveSettings(candidate);
-  settings = candidate;
-  // A changed CDP address drops the current browser connection.
+  // Validate and commit synchronously, before any await, so no job can be
+  // admitted between the check and the change. updateSettings refuses a CDP
+  // address change while extracting and drops the connection otherwise.
+  validateSettings(candidate);
   job.updateSettings(candidate);
+  settings = candidate;
+  try {
+    await saveSettings(candidate);
+  } catch (error) {
+    throw new Error(
+      `設定已套用但未能寫入設定檔：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   return { tools: await checkTools(candidate) };
 });
 
