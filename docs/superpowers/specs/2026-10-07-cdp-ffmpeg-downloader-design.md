@@ -56,6 +56,7 @@ ffmpeg-downloader/
 │  ├─ extract.ts          # 在分頁執行頁面腳本、分塊取回檔案寫入暫存目錄
 │  ├─ ffmpeg.ts           # 工具檢查、ffprobe 取長度、執行 ffmpeg 與進度解析
 │  ├─ filename.ts         # 檔名清理
+│  ├─ publish.ts          # 將成品安全地發佈到輸出資料夾
 │  ├─ job.ts              # 工作狀態機與暫存目錄生命週期
 │  └─ ui-assets.ts        # 以 text import 匯入 ui/ 檔案
 ├─ ui/
@@ -160,6 +161,7 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 ### 6.2 `cdp/probe.ts`
 
 - `probeCdpPort(address: string, timeoutMs = 1000): Promise<boolean>`：以 `Deno.connect({ hostname, port })` 建立 TCP 連線，成功即立刻 `close()` 並回傳 `true`；連線被拒或逾時回傳 `false`。**不送出任何資料、不做 WebSocket handshake**（假設 A1）。
+- `probeTarget(settings: Settings): string`：決定探測位址。`cdpWsUrl` 非空時取其 URL 的 `host:port`（無明確 port 時 `ws://` 用 80、`wss://` 用 443）；否則用 `cdpAddress`。`probe` binding 一律探測此位址，因此探測結果與 `connect()` 實際連線的目標一致。
 
 ### 6.3 `cdp/discovery.ts`
 
@@ -175,7 +177,8 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 ```ts
 class CdpClient {
   static connect(url: string, opts?: { timeoutMs?: number }): Promise<CdpClient>;
-  send<T = unknown>(method: string, params?: object, sessionId?: string): Promise<T>;
+  send<T = unknown>(method: string, params?: object, sessionId?: string,
+    opts?: { timeoutMs?: number }): Promise<T>;
   on(method: string, handler: (params: unknown, sessionId?: string) => void): () => void;
   readonly closed: Promise<void>;   // resolves when the socket closes for any reason
   close(): void;
@@ -184,7 +187,7 @@ class CdpClient {
 
 - 每個請求帶遞增 `id`，回應以 `id` 對應；回應含 `error` → 以 `CdpError { code, message }` reject。
 - 無 `id` 的訊息視為事件，依 `method` 分派給 `on` 註冊的 handler（同時傳入訊息的 `sessionId`）。
-- 每個請求預設逾時 60 秒，逾時以 `CdpTimeoutError` reject 並移除 pending。
+- 每個請求預設逾時 60 秒，可由 `send` 的第四個參數 `opts?: { timeoutMs?: number }` 覆寫；逾時以 `CdpTimeoutError` reject 並移除 pending（之後才到達的回應直接丟棄）。
 - 連線建立逾時（預設 10 秒，涵蓋使用者在 Chrome 授權對話框的等待）以 `CdpConnectError` reject。
 - socket 關閉或錯誤 → 所有 pending 以 `CdpClosedError` reject，`closed` resolve，之後的 `send` 立即 reject。
 - **整個 App 生命週期只建立一條 browser 連線**（由 `job.ts` 持有），避免重複觸發授權對話框；連線關閉後必須由使用者再次按「連線」才會重建。
@@ -205,18 +208,20 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 流程：
 
 1. `Target.attachToTarget { targetId, flatten: true }` 取得 `sessionId`；同時以 `client.on("Target.detachedFromTarget", ...)` 監聽，若收到相同 `sessionId` 的事件，標記中止，後續步驟以 `ExtractError("分頁已關閉或已中斷偵錯連線")` 結束。
-2. 以 `Runtime.evaluate`（`awaitPromise: true, returnByValue: true`，帶 `sessionId`）執行 wrapper 運算式：
+2. 每次擷取產生唯一的 `token`（`crypto.randomUUID()`）。頁面端所有資料都放在 `window.__ffdl[token]`（`window.__ffdl` 不存在時先建立為空物件），不同擷取之間互不覆寫。
+3. 以 `Runtime.evaluate`（`awaitPromise: true, returnByValue: true`，帶 `sessionId`，逾時 **300 秒**，因為使用者腳本可能需要下載資料）執行 wrapper 運算式：
    - 以 `(${pageScript.toString()})()` 呼叫使用者腳本。
-   - 驗證 `main`、`aux` 為 `ArrayBuffer` 或 `ArrayBufferView`，轉成 `Uint8Array` 存入 `window.__ffdl = { bufs: { main, aux }, read(name, offset, length) }`。
+   - 腳本完成後，若 `window.__ffdl_cancelled?.[token]` 為 true（此次擷取已被 Deno 端放棄），直接丟棄結果、不寫入 `window.__ffdl[token]`。
+   - 驗證 `main`、`aux` 為 `ArrayBuffer` 或 `ArrayBufferView`，轉成 `Uint8Array` 存入 `window.__ffdl[token] = { main, aux }`。
    - 驗證 `info` 為純物件、值只能是 string/number/boolean，否則丟出例外。
    - 回傳 `{ info, sizes: { main, aux } }`。
-3. 回應含 `exceptionDetails` → `ExtractError`，訊息取 `exceptionDetails.exception.description`，沒有時用 `exceptionDetails.text`。
-4. 依序取回 main、aux：每塊 **4 MiB**，以 `Runtime.evaluate` 呼叫 `window.__ffdl.read(name, offset, length)`，取得該區段的 base64 字串：
+4. 回應含 `exceptionDetails` → `ExtractError`，訊息取 `exceptionDetails.exception.description`，沒有時用 `exceptionDetails.text`。
+5. 依序取回 main、aux：每塊 **4 MiB**，以 `Runtime.evaluate` 執行讀取運算式，取得 `window.__ffdl[token][name]` 中 `[offset, offset+length)` 區段的 base64 字串：
    - 頁面端：`Uint8Array.prototype.toBase64` 存在就直接用；不存在則以 `FileReader.readAsDataURL(new Blob([slice]))` 轉換並去掉 `data:...;base64,` 前綴。
-   - 若 `window.__ffdl` 不存在（頁面重新載入或導頁）→ `ExtractError("頁面資料遺失，分頁可能已重新載入")`。
+   - 若 `window.__ffdl?.[token]` 不存在（頁面重新載入或導頁）→ `ExtractError("頁面資料遺失，分頁可能已重新載入")`。
    - Deno 端以 `Uint8Array.fromBase64()` 解碼後，依序寫入 `<tempDir>/main.bin`、`<tempDir>/aux.bin`，每寫完一塊呼叫 `onProgress(累計位元組, main+aux 總位元組)`。
-5. 寫完後比對檔案大小與 `sizes`，不符 → `ExtractError`。
-6. `finally`：盡力執行 `delete window.__ffdl` 與 `Target.detachFromTarget`（錯誤忽略），並取消事件監聽。
+6. 寫完後比對檔案大小與 `sizes`，不符 → `ExtractError`。
+7. `finally`：盡力（錯誤忽略）以一個運算式同時設定 `window.__ffdl_cancelled[token] = true` 並 `delete window.__ffdl[token]`，接著 `Target.detachFromTarget`，最後取消事件監聽。如此一來，逾時後才完成的使用者腳本不會留下資料，也不會影響其他擷取。
 - 大小為 0 的檔案合法（寫出空檔、不發 read 請求）。
 
 ### 6.7 `filename.ts`
@@ -245,7 +250,8 @@ type JobStatus =
   | { state: "extracting"; received: number; total: number }
   | { state: "ready"; info: Info; columns: { key: string; label: string }[];
       mainSize: number; auxSize: number; defaultFilename: string }
-  | { state: "processing"; percent: number | null; outTimeSec: number;
+  | { state: "processing"; phase: "preparing" | "running" | "publishing";
+      percent: number | null; outTimeSec: number;
       durationSec: number | null; speed: number | null }
   | { state: "done"; outputPath: string }
   | { state: "failed"; stage: "extract" | "process"; message: string; detail?: string[] }
@@ -259,20 +265,27 @@ type JobStatus =
 | `extract(targetId)` | idle / done / failed / cancelled | → extracting；建立暫存目錄 `Deno.makeTempDir({ prefix: "ffdl-" })`；成功 → ready；失敗 → failed(extract) 並刪除暫存目錄 |
 | `discard()` | ready | 刪除暫存目錄 → idle |
 | `startProcess(filename, overwrite)` | ready | 見下方 |
-| `cancel()` | processing | 呼叫 `FfmpegRun.cancel()`；結束後 → cancelled |
+| `cancel()` | processing（phase 為 preparing 或 running） | 設定 `cancelRequested = true`；若 ffmpeg 已啟動則呼叫 `FfmpegRun.cancel()`；清理完成後 → cancelled。phase 為 publishing 時呼叫則忽略（搬移不可中斷，以免輸出資料夾留下半成品） |
 | `reset()` | done / failed / cancelled | → idle |
 
 其他狀態下呼叫上述動作 → 丟出錯誤「目前有工作進行中」（同一時間只允許一個工作）。
 
+**互斥保證**：所有動作在第一個 `await` 之前**同步**檢查並切換狀態（`extract` → extracting、`startProcess` → processing/preparing），因此重疊的 binding 呼叫中只有第一個能通過檢查，其餘立即得到「目前有工作進行中」。`discard()` 同步地把狀態設為 idle 並把暫存目錄路徑從 job 上摘除，再於背景刪除該目錄；被摘除的目錄不再被任何工作引用（新的 `extract` 一定建立新的暫存目錄），所以不會與後續工作互相干擾。done / failed / cancelled 這些終止狀態**只在暫存目錄清理完成後**才設定，所以終止狀態下可以安全接受新工作。
+
 `startProcess(filename, overwrite)`：
 
-1. `sanitizeFilename(filename)`；`outputDir` 不存在時遞迴建立。
-2. 目標 `<outputDir>/<filename>` 已存在且 `overwrite === false` → 回傳 `{ needsConfirm: true }`，狀態維持 ready（UI 以 `confirm()` 詢問後帶 `overwrite: true` 重呼叫）。
-3. 進入 processing。`PROBE_DURATION` 為 true 時以 `probeDuration` 取得長度（失敗 → `null`），否則 `null`。
-4. ffmpeg 輸出先寫到 `<tempDir>/out/<filename>`（`buildFfmpegArgs` 收到的 `outputPath`），避免取消或失敗時在輸出資料夾留下殘檔。
-5. 結束碼 0 且輸出檔存在 → 以 `Deno.rename` 移到 `<outputDir>/<filename>`；`rename` 因跨裝置失敗時改用 `copyFile` + `remove` → done。結束碼 0 但輸出檔不存在 → failed(process,「ffmpeg 未產生輸出檔，請檢查 buildFfmpegArgs 是否寫入 outputPath」)。
-6. 結束碼非 0 → failed(process)，`detail` 為 stderr 最後 20 行；已呼叫 cancel → cancelled。
-7. `finally`：刪除整個暫存目錄。
+1. 同步：檢查狀態為 ready、`sanitizeFilename(filename)`（失敗則丟錯、狀態不變），切到 processing（phase=preparing）、`cancelRequested = false`。
+2. `outputDir` 不存在時遞迴建立；失敗 → failed(process)。
+3. 目標 `<outputDir>/<filename>` 已存在且 `overwrite === false` → 狀態**還原為原本的 ready**，回傳 `{ needsConfirm: true }`（UI 以 `confirm()` 詢問後帶 `overwrite: true` 重呼叫）。
+4. `PROBE_DURATION` 為 true 時以 `probeDuration` 取得長度（失敗 → `null`），否則 `null`。
+5. 每個 `await` 之後檢查 `cancelRequested`；為 true 時**不啟動 ffmpeg**，直接進入清理並以 cancelled 結束。
+6. phase=running，啟動 ffmpeg。輸出先寫到 `<tempDir>/out/<filename>`（`buildFfmpegArgs` 收到的 `outputPath`），避免取消或失敗時在輸出資料夾留下殘檔。
+7. 結束後依序判斷：已要求取消 → cancelled；結束碼非 0 → failed(process)，`detail` 為 stderr 最後 20 行；結束碼 0 但輸出檔不存在 → failed(process,「ffmpeg 未產生輸出檔，請檢查 buildFfmpegArgs 是否寫入 outputPath」)。
+8. 結束碼 0 且輸出檔存在 → phase=publishing，以 `src/publish.ts` 的 `publishOutput(tempOutput, finalPath)` **發佈**到 `<outputDir>/<filename>`：
+   - 先嘗試 `Deno.rename(tempOutput, finalPath)`（同一磁碟時為原子操作）。
+   - 若因跨裝置失敗：先 `copyFile` 到輸出資料夾內的暫存名稱 `<outputDir>/.<filename>.ffdl-<隨機>.part`，確認大小與來源一致後，再以同資料夾內的 `Deno.rename` 換成 `finalPath`（原子操作）。複製或確認失敗時刪除 `.part` 檔、保留既有的 `finalPath` 不動 → failed(process)，訊息附系統錯誤。
+   - 成功 → done。
+9. `finally`：刪除整個暫存目錄，之後才設定終止狀態。
 
 暫存清理：
 
@@ -307,18 +320,29 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 
 ### 6.11 UI（`ui/`）
 
-單頁，依狀態切換畫面：
+單頁。**畫面由 `(JobStatus.state, connected)` 決定**，job 狀態優先於連線狀態：
 
-1. **連線**：進入時呼叫 `probe()`，埠未開啟時每 2 秒自動重探。
+| job 狀態 | connected | 畫面 |
+| --- | --- | --- |
+| extracting | – | 3 擷取中 |
+| ready | – | 4 預覽 |
+| processing | – | 5 處理中 |
+| done / failed / cancelled | – | 6 結果 |
+| idle | false | 1 連線 |
+| idle | true | 2 分頁清單 |
+
+也就是說，連線中斷**不會**讓預覽、處理中、結果畫面消失：ready 的工作仍可開始處理（處理只用暫存檔，不需要 CDP），處理中的工作仍可取消，結果仍可查看；直到工作回到 idle（`discard()` 或 `reset()`）時，才依 `connected` 決定回到連線畫面或分頁清單。UI 在 extracting / processing 期間每 250 ms 輪詢 `getStatus()`，其他畫面在每次操作後呼叫 `getStatus()` 與 `getConnection()` 重新決定畫面。
+
+1. **連線**：進入時呼叫 `probe()`（探測位址見 §6.2 `probeTarget`），埠未開啟時每 2 秒自動重探。
    - 未開啟：引導文字「請在 Chrome 網址列開啟 `chrome://inspect/#remote-debugging` 並打開遠端偵錯開關」＋目前探測位址＋「重試」與「設定」。
    - 已開啟：顯示「偵測到 Chrome 偵錯埠」與「連線」按鈕；按下才呼叫 `connect()`，並提示「請在 Chrome 跳出的對話框按允許」。連線失敗顯示錯誤訊息並留在此畫面。
 2. **分頁清單**：`listTabs()` 結果（標題、URL），可「重新整理」；無符合分頁時顯示空狀態與目前的 `URL_PATTERN`。點選分頁 → `extract()`。
 3. **擷取中**：每 250 ms 呼叫 `getStatus()`，顯示已傳輸/總位元組。
-4. **預覽**：info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`；「開始處理」與「取消」（`discard()`）。`startProcess` 回傳 `needsConfirm` 時以原生 `confirm()` 詢問是否覆蓋。工具檢查未通過時停用「開始處理」並提示到設定頁修正。
-5. **處理中**：每 250 ms 輪詢；`percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間；顯示速度；「取消」按鈕。
-6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。皆有「再一次」（`reset()` 後回到分頁清單；若連線已斷則回到連線畫面）。
+4. **預覽**：info 表格 + 檔案大小；檔名輸入框預填 `defaultFilename`；「開始處理」與「取消」（`discard()`）。`startProcess` 回傳 `needsConfirm` 時以原生 `confirm()` 詢問是否覆蓋。**只有 ffmpeg 檢查未通過**時才停用「開始處理」並提示到設定頁修正；ffprobe 檢查未通過只在設定頁顯示警告（`PROBE_DURATION=true` 時處理仍可進行，進度改為不確定）。
+5. **處理中**：phase=preparing 顯示「準備中」；running 時 `percent` 非 null 顯示百分比進度條與「目前時間 / 總長度」，否則顯示不確定進度條與已處理時間，並顯示速度；publishing 顯示「輸出檔案中」。preparing / running 時有「取消」按鈕，publishing 時停用。
+6. **結果**：done → 輸出路徑 +「在 Finder 中顯示」；failed → 訊息與 `detail`（等寬字型）；cancelled → 已取消。皆有「再一次」（`reset()`，之後依上表決定畫面）。
 - **設定**（任何畫面可開啟）：§6.1 的欄位、ffmpeg/ffprobe 檢查結果、載入時的 warning。
-- 任何 binding 呼叫若回報連線已關閉，UI 回到連線畫面。
+- 分頁清單畫面上的 binding 呼叫若回報連線已關閉，`connected` 變 false，依上表回到連線畫面。
 
 ## 7. 建置與執行
 
@@ -337,13 +361,14 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 | CDP 埠未開啟 | 連線畫面引導 + 自動重探 |
 | `DevToolsActivePort` 不存在 / 格式錯誤 / port 不符 | `connect()` 失敗，顯示 §6.3 的訊息 |
 | 使用者在 Chrome 拒絕授權或逾時 | `connect()` 失敗，提示可再試 |
-| 連線中途斷開 | `connected=false`；進行中的擷取失敗；UI 回到連線畫面（ffmpeg 處理不受影響） |
+| 連線中途斷開 | `connected=false`；進行中的擷取失敗；ready / processing / 結果畫面不受影響，工作回到 idle 後才顯示連線畫面（§6.11） |
 | 頁面腳本例外 / 回傳格式不符 | failed(extract)，顯示例外訊息 |
 | 擷取中分頁關閉或重新載入 | failed(extract)，訊息見 §6.6 |
-| ffmpeg/ffprobe 無法執行 | 設定頁顯示錯誤，停用「開始處理」；ffprobe 失敗只影響進度顯示（`PROBE_DURATION=true` 時仍可處理，進度改為不確定） |
+| ffmpeg 無法執行 | 設定頁顯示錯誤，停用「開始處理」 |
+| ffprobe 無法執行或取長度失敗 | 設定頁顯示警告；不阻擋處理，進度改為不確定 |
 | ffmpeg 結束碼非 0 | failed(process) + stderr 最後 20 行 |
 | 輸出檔已存在 | 原生 `confirm()` 詢問覆蓋 |
-| 輸出資料夾無法建立 / 移動失敗 | failed(process)，顯示系統錯誤訊息 |
+| 輸出資料夾無法建立 / 發佈失敗 | failed(process)，顯示系統錯誤訊息；發佈失敗時既有的同名檔保持不動、`.part` 檔已刪除（§6.9） |
 | 任一結束路徑 | 暫存目錄刪除 |
 
 ## 9. 測試策略
@@ -352,9 +377,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 
 - **純函式單元測試**：`parseDevToolsActivePort`（正常、缺第二行、port 非法、path 非 `/` 開頭、多餘空行）、`resolveBrowserWsUrl`（`cdpWsUrl` 優先、檔案不存在、port 不符；使用測試建立的暫存目錄放 `DevToolsActivePort`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
-- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止。
+- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
-- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`、取消、失敗時暫存目錄都被刪除、忙碌時拒絕新工作。
+- **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready）、running 中取消、preparing 中取消（ffmpeg 不會被啟動）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在暫存目錄刪除後出現。
+- **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真 Chrome 無法自動化）：
   1. Chrome 未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且 Chrome **未**跳出授權對話框（A1）。
   2. 按連線 → Chrome 跳出授權對話框一次；允許後看到分頁清單。
@@ -374,3 +400,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：`
 - 不支援遠端（非本機）且需驗證的 CDP 端點。
 - 檔案大小以「數十 MB 以內」為設計目標；未針對 GB 級檔案最佳化（仍以 4 MiB 分塊、串流寫檔，不會整檔載入 Deno 記憶體，但頁面端需同時持有兩個 buffer）。
 - UI 只提供繁體中文。
+- **輸出檔撞名競態**
+  - Concern：使用者選擇不覆蓋（或確認時檔案不存在）之後，若 ffmpeg 處理期間有其他程式在輸出資料夾建立同名檔，最後發佈時的 rename 會靜默取代該檔。
+  - Decision：不實作（不使用「不取代」的原子發佈、不在撞名時保留成品重新詢問）。
+  - Rationale：使用者裁決；單人使用的本機工具中，處理期間外部程式剛好建立同名檔幾乎不可能發生，成本（新狀態、UI 分支、測試）與風險不成比例。
