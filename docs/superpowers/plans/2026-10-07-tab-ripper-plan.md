@@ -3277,13 +3277,13 @@ Deno.test({
 });
 
 Deno.test({
-  name: "extractFromTab keeps a multi-line page exception and drops stack frames",
+  name: "extractFromTab reports the exception description unchanged",
   ...opts,
   fn: async () => {
     const h = await harness({ wrapperException: "line one\nline two" });
     try {
       const error = await assertRejects(() => extractFromTab(h.client, "T1", h.dir, () => {}), ExtractError);
-      assertEquals((error as Error).message, "Error: line one\nline two");
+      assertEquals((error as Error).message, "Error: line one\nline two\n    at <anonymous>:1:1");
     } finally {
       await h.dispose();
     }
@@ -3541,11 +3541,8 @@ async function evaluate(
   );
   const details = response.exceptionDetails;
   if (details) {
-    const raw = details.exception?.description ?? details.text ?? "頁面腳本發生錯誤";
-    // Keep the whole description (multi-line messages included); drop only
-    // the stack-frame lines.
-    const message = raw.split("\n").filter((line) => !/^\s+at /.test(line)).join("\n").trim();
-    throw new PageException(message || raw);
+    // The exception description as-is (message and stack), falling back to text.
+    throw new PageException(details.exception?.description ?? details.text ?? "頁面腳本發生錯誤");
   }
   return response.result?.value;
 }
@@ -3695,7 +3692,7 @@ Expected: `ok | 21 passed | 0 failed`.
 
 ```ts
 import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
-import { JobManager, NOT_CONNECTED_MESSAGE } from "../src/job.ts";
+import { ADDRESS_CHANGED_MESSAGE, JobManager, NOT_CONNECTED_MESSAGE } from "../src/job.ts";
 import type { Settings } from "../src/types.ts";
 import { FakeCdpServer } from "./helpers/fake_cdp.ts";
 import { fakePage } from "./helpers/fake_page.ts";
@@ -3790,6 +3787,58 @@ Deno.test({
 });
 
 Deno.test({
+  name: "changing the CDP address drops the current connection",
+  ...opts,
+  fn: async () => {
+    const server = new FakeCdpServer({ handler: fakePage().handler });
+    const other = new FakeCdpServer({ handler: fakePage().handler });
+    const job = new JobManager(settingsFor(server.address));
+    try {
+      await job.connect();
+      job.updateSettings(settingsFor(server.address)); // Same address: connection kept.
+      assertEquals(job.isConnected(), true);
+      job.updateSettings(settingsFor(other.address));
+      assertEquals(job.isConnected(), false);
+      await waitFor(() => server.connections[0].socket.readyState === WebSocket.CLOSED, "old socket closed");
+      await job.connect();
+      assertEquals(other.upgradeRequests, 1);
+      assertEquals(job.isConnected(), true);
+    } finally {
+      await server.close();
+      await other.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "a connection attempt to the old address is rejected after an address change",
+  ...opts,
+  fn: async () => {
+    const server = new FakeCdpServer({ handler: fakePage().handler, upgradeDelayMs: 300 });
+    const job = new JobManager(settingsFor(server.address));
+    try {
+      const connecting = job.connect();
+      connecting.catch(() => {});
+      job.updateSettings(settingsFor(await closedPortAddress()));
+      await assertRejects(() => connecting, Error, ADDRESS_CHANGED_MESSAGE);
+      assertEquals(job.isConnected(), false);
+      await waitFor(
+        () => server.connections[0]?.socket.readyState === WebSocket.CLOSED,
+        "stale socket closed",
+      );
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test("assertSettingsChangeAllowed accepts changes while not extracting", () => {
+  const job = new JobManager(settingsFor("127.0.0.1:9222"));
+  job.assertSettingsChangeAllowed(settingsFor("127.0.0.1:9333"));
+  job.assertSettingsChangeAllowed({ ...settingsFor("127.0.0.1:9222"), outputDir: "/tmp/elsewhere" });
+});
+
+Deno.test({
   name: "a dropped connection is detected and a stale close does not affect the next one",
   ...opts,
   fn: async () => {
@@ -3820,9 +3869,15 @@ import type { JobStatus, Settings, TabInfo } from "./types.ts";
 export const BUSY_MESSAGE = "目前有工作進行中";
 export const SHUTTING_DOWN_MESSAGE = "程式正在結束";
 export const NOT_CONNECTED_MESSAGE = "尚未連線到瀏覽器";
+export const ADDRESS_LOCKED_MESSAGE = "擷取中無法變更 CDP 位址";
+export const ADDRESS_CHANGED_MESSAGE = "CDP 位址已變更，請重新連線";
 
 export class JobManager {
   constructor(_settings: Settings) {}
+
+  assertSettingsChangeAllowed(_settings: Settings): void {
+    throw new Error("not implemented");
+  }
 
   updateSettings(_settings: Settings): void {
     throw new Error("not implemented");
@@ -3853,7 +3908,7 @@ export class JobManager {
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/job_connection_test.ts`
-Expected: 6 tests FAIL (`not implemented`, or message mismatch for the connect-failure test).
+Expected: 9 tests FAIL (`not implemented`, or message mismatch for the connect-failure tests).
 
 - [ ] **Step 4: Implement** — replace `src/job.ts`
 
@@ -3867,6 +3922,8 @@ import { URL_PATTERN } from "../user/config.ts";
 export const BUSY_MESSAGE = "目前有工作進行中";
 export const SHUTTING_DOWN_MESSAGE = "程式正在結束";
 export const NOT_CONNECTED_MESSAGE = "尚未連線到瀏覽器";
+export const ADDRESS_LOCKED_MESSAGE = "擷取中無法變更 CDP 位址";
+export const ADDRESS_CHANGED_MESSAGE = "CDP 位址已變更，請重新連線";
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -3887,8 +3944,26 @@ export class JobManager {
     this.#settings = { ...settings };
   }
 
+  /** Throws when `settings` may not be applied right now (call before saving to disk). */
+  assertSettingsChangeAllowed(settings: Settings): void {
+    if (settings.cdpAddress !== this.#settings.cdpAddress && this.#status.state === "extracting") {
+      throw new Error(ADDRESS_LOCKED_MESSAGE);
+    }
+  }
+
+  /**
+   * Applies new settings. A changed CDP address drops the current browser
+   * connection; a pending connection attempt to the old address is rejected
+   * when it completes. The user then reconnects explicitly.
+   */
   updateSettings(settings: Settings): void {
+    this.assertSettingsChangeAllowed(settings);
+    const addressChanged = settings.cdpAddress !== this.#settings.cdpAddress;
     this.#settings = { ...settings };
+    if (addressChanged) {
+      this.#client?.close();
+      this.#client = null;
+    }
   }
 
   get isShuttingDown(): boolean {
@@ -3922,6 +3997,10 @@ export class JobManager {
         client.close();
         throw new Error(SHUTTING_DOWN_MESSAGE);
       }
+      if (this.#settings.cdpAddress !== address) {
+        client.close();
+        throw new Error(ADDRESS_CHANGED_MESSAGE);
+      }
       this.#client = client;
       // Bound to this client: a stale close must not clear a newer connection.
       void client.closed.then(() => {
@@ -3951,7 +4030,7 @@ export class JobManager {
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/job_connection_test.ts`
-Expected: `ok | 6 passed | 0 failed`.
+Expected: `ok | 9 passed | 0 failed`.
 
 - [ ] **Step 6: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -4078,7 +4157,7 @@ export async function readyJob(
 ```ts
 import { assert, assertEquals, assertThrows } from "@std/assert";
 import { join } from "@std/path";
-import { BUSY_MESSAGE, JobManager, NOT_CONNECTED_MESSAGE } from "../src/job.ts";
+import { ADDRESS_LOCKED_MESSAGE, BUSY_MESSAGE, JobManager, NOT_CONNECTED_MESSAGE } from "../src/job.ts";
 import { INFO_COLUMNS } from "../user/info.ts";
 import { listDir, newSessionTempDirs, pathExists, sessionTempDirs, waitFor } from "./helpers/fixtures.ts";
 import { connectedJob, readyJob, waitForState } from "./helpers/job_fixture.ts";
@@ -4148,13 +4227,39 @@ Deno.test({
     try {
       f.job.extract("T1");
       const status = await waitForState(f.job, ["failed"]);
-      assertEquals(status, { state: "failed", stage: "extract", message: "Error: boom" });
+      assertEquals(status, {
+        state: "failed",
+        stage: "extract",
+        message: "Error: boom\n    at <anonymous>:1:1",
+      });
       assertEquals(await newSessionTempDirs(before), []);
       f.job.extract("T1"); // allowed straight from failed
       await waitForState(f.job, ["failed"]);
       f.job.reset();
       assertEquals(f.job.getStatus(), { state: "idle" });
       assertThrows(() => f.job.reset(), Error, BUSY_MESSAGE);
+    } finally {
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
+  name: "the CDP address cannot change while extracting",
+  ...opts,
+  fn: async () => {
+    const f = await connectedJob({ hangWrapper: true });
+    try {
+      f.job.extract("T1");
+      await waitFor(() => f.page.wrapperTokens.length === 1, "wrapper sent");
+      const changed = { ...f.settings, cdpAddress: "127.0.0.1:9" };
+      assertThrows(() => f.job.assertSettingsChangeAllowed(changed), Error, ADDRESS_LOCKED_MESSAGE);
+      assertThrows(() => f.job.updateSettings(changed), Error, ADDRESS_LOCKED_MESSAGE);
+      assertEquals(f.job.isConnected(), true);
+      assertEquals(f.job.getStatus().state, "extracting");
+      // Other settings may still change while extracting.
+      f.job.updateSettings({ ...f.settings, outputDir: f.outputDir + "-2" });
+      assertEquals(f.job.isConnected(), true);
     } finally {
       await f.dispose();
     }
@@ -4200,7 +4305,7 @@ Deno.test({
 - [ ] **Step 5: Run test to verify it fails**
 
 Run: `deno task test tests/job_extract_test.ts`
-Expected: 5 tests FAIL — `readyJob`/`extract` throw `not implemented`; the connection test fails because `not implemented` is thrown instead of `尚未連線到瀏覽器`.
+Expected: 6 tests FAIL — `readyJob`/`extract` throw `not implemented`; the connection test fails because `not implemented` is thrown instead of `尚未連線到瀏覽器`.
 
 - [ ] **Step 6: Implement** — in `src/job.ts`:
 
@@ -4332,7 +4437,7 @@ Replace the three skeleton methods with:
 - [ ] **Step 7: Run test to verify it passes**
 
 Run: `deno task test tests/job_extract_test.ts tests/job_connection_test.ts`
-Expected: `ok | 11 passed | 0 failed`.
+Expected: `ok | 15 passed | 0 failed`.
 
 - [ ] **Step 8: Verification gate** — `deno task check && deno task lint && deno fmt && deno fmt --check`
 
@@ -4399,6 +4504,12 @@ async function fakeTools() {
   return {
     hang: await makeExecutable(dir, "hang", "exec sleep 30"),
     slowWriter: await makeExecutable(dir, "slow-writer", 'for last; do :; done\nsleep 1\nprintf fake > "$last"'),
+    /** Writes its output immediately, then lingers 1 s before exiting 0. */
+    writeThenWait: await makeExecutable(
+      dir,
+      "write-then-wait",
+      'for last; do :; done\nprintf fake > "$last"\nsleep 1\nexit 0',
+    ),
     failing: await makeExecutable(dir, "failing", 'echo "boom from ffmpeg" >&2\nexit 3'),
     silent: await makeExecutable(dir, "silent", "exit 0"),
     /** Real ffmpeg slowed to real time, so a job stays in "running" for ~3 s. */
@@ -4753,6 +4864,41 @@ Deno.test({
 });
 
 Deno.test({
+  name: "an undeletable out/ is reported and its stale output is never published on retry",
+  ...base,
+  fn: async () => {
+    const tools = await fakeTools();
+    const { f, tempDir } = await videoJob({ ffmpegPath: tools.writeThenWait });
+    const outDir = join(tempDir, "out");
+    try {
+      await f.job.startProcess("stale.mp4", null);
+      // The fake has written its output and is still running for ~1 s.
+      await waitFor(() => pathExists(join(outDir, "stale.mp4")), "output written");
+      // Publishing will fail (read-only destination) and out/ cannot be emptied.
+      await Deno.chmod(f.outputDir, 0o500);
+      await Deno.chmod(outDir, 0o500);
+      const status = await waitForState(f.job, ["ready", "done", "failed"]);
+      assert(status.state === "ready", JSON.stringify(status));
+      assertStringIncludes(status.lastError ?? "", "輸出失敗：");
+      assertStringIncludes(status.lastError ?? "", "暫存輸出未能刪除");
+      await Deno.chmod(outDir, 0o755);
+      await Deno.chmod(f.outputDir, 0o755);
+      // A tool that writes nothing must not let the stale out/stale.mp4 be published.
+      f.job.updateSettings({ ...f.settings, ffmpegPath: tools.silent });
+      await f.job.startProcess("stale.mp4", null);
+      const retry = await waitForState(f.job, ["done", "failed"]);
+      assert(retry.state === "failed", JSON.stringify(retry));
+      assertEquals(retry.message, "ffmpeg 未產生輸出檔，請檢查 buildFfmpegArgs 是否寫入 outputPath");
+      assertEquals(await pathExists(join(f.outputDir, "stale.mp4")), false);
+    } finally {
+      await Deno.chmod(outDir, 0o755).catch(() => {});
+      await Deno.chmod(f.outputDir, 0o755).catch(() => {});
+      await f.dispose();
+    }
+  },
+});
+
+Deno.test({
   name: "a cancel issued right after startProcess with an unusable destination cancels and cleans up",
   ...base,
   fn: async () => {
@@ -4855,7 +5001,7 @@ Deno.test({
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: 20 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`), and the `urlPattern` test fails because the skeleton getter returns `""`.
+Expected: 21 tests FAIL — `startProcess` rejects with `not implemented` (the filename test fails because the message is not `檔名無效`), and the `urlPattern` test fails because the skeleton getter returns `""`.
 
 - [ ] **Step 4: Implement** — in `src/job.ts`:
 
@@ -4992,6 +5138,7 @@ Replace the two skeleton methods with:
     // main/aux for a retry. keep-all: overwrite confirmation pending.
     let cleanup: "remove-all" | "keep-inputs" | "keep-all" = "remove-all";
     let next: JobStatus = { state: "cancelled" };
+    let destinationError = "";
     try {
       try {
         await Deno.mkdir(ctx.settings.outputDir, { recursive: true });
@@ -5006,7 +5153,8 @@ Replace the two skeleton methods with:
       } catch (error) {
         if (!this.#cancelRequested) {
           cleanup = "keep-inputs";
-          next = this.#readyStatus(`輸出失敗：${errorMessage(error)}`);
+          destinationError = `輸出失敗：${errorMessage(error)}`;
+          next = this.#readyStatus(destinationError);
         }
         return;
       }
@@ -5022,6 +5170,11 @@ Replace the two skeleton methods with:
       if (PROBE_DURATION) {
         this.#probeWarning = durationSec === null ? "無法以 ffprobe 取得長度，進度改為不確定顯示；請檢查 ffprobe 路徑" : null;
       }
+      // Start from an empty out/: a leftover from an earlier failed attempt
+      // must never be mistaken for this run's output.
+      await Deno.remove(outDir, { recursive: true }).catch((error) => {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      });
       await Deno.mkdir(outDir, { recursive: true });
       if (this.#cancelRequested) return;
 
@@ -5080,7 +5233,8 @@ Replace the two skeleton methods with:
         await publishOutput(tempOutput, ctx.finalPath);
       } catch (error) {
         cleanup = "keep-inputs";
-        next = this.#readyStatus(`輸出失敗：${errorMessage(error)}`);
+        destinationError = `輸出失敗：${errorMessage(error)}`;
+        next = this.#readyStatus(destinationError);
         return;
       }
       next = { state: "done", outputPath: ctx.finalPath };
@@ -5093,7 +5247,16 @@ Replace the two skeleton methods with:
       this.#run = null;
       this.#abort = null;
       if (cleanup === "keep-inputs") {
-        await Deno.remove(outDir, { recursive: true }).catch(() => {});
+        try {
+          await Deno.remove(outDir, { recursive: true });
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) {
+            // Report the leftover; the next run clears out/ before starting ffmpeg.
+            next = this.#readyStatus(
+              `${destinationError}；暫存輸出未能刪除：${outDir}（${errorMessage(error)}）`,
+            );
+          }
+        }
         // A cancel accepted during that await wins: clean everything up.
         if (this.#cancelRequested) {
           cleanup = "remove-all";
@@ -5105,6 +5268,8 @@ Replace the two skeleton methods with:
         this.#tempDir = null;
         this.#extracted = null;
         this.#lastFilename = null;
+        // A cancel accepted while cleaning up after a failure is honoured.
+        if (this.#cancelRequested && next.state === "failed") next = { state: "cancelled" };
         if (warning && (next.state === "done" || next.state === "failed" || next.state === "cancelled")) {
           next = { ...next, cleanupWarning: warning };
         }
@@ -5119,7 +5284,7 @@ Replace the two skeleton methods with:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `deno task test tests/job_process_test.ts`
-Expected: `ok | 20 passed | 0 failed`.
+Expected: `ok | 21 passed | 0 failed`.
 
 - [ ] **Step 6: Run the whole suite** — `deno task test` → all tests pass.
 
@@ -5289,17 +5454,22 @@ Deno.test({
   ignore: !FFMPEG,
   fn: async () => {
     const toolDir = await makeTempDir();
-    const stubborn = await makeExecutable(toolDir, "stubborn", "trap '' TERM\nexec sleep 30");
+    const ready = join(toolDir, "trap-installed");
+    const stubborn = await makeExecutable(
+      toolDir,
+      "stubborn",
+      `trap '' TERM\ntouch "${ready}"\nexec sleep 30`,
+    );
     const f = await readyJob({ main: VIDEO }, { ffmpegPath: stubborn });
     try {
       await f.job.startProcess("s.mp4", null);
-      await waitFor(() => {
-        const s = f.job.getStatus();
-        return s.state === "processing" && s.phase === "running";
-      }, "running phase");
+      // Only after the child has installed its TERM trap does SIGTERM become ineffective.
+      await waitFor(() => pathExists(ready), "trap installed");
       const start = Date.now();
       await f.job.shutdown({ deadlineMs: 800 });
-      assert(Date.now() - start < 2000);
+      const elapsed = Date.now() - start;
+      // The child ignored SIGTERM, so shutdown had to wait for its deadline.
+      assert(elapsed >= 700 && elapsed < 2000, `elapsed ${elapsed}`);
       await waitFor(() => activeChildCount() === 0, "children killed", 3000);
       await waitForState(f.job, ["cancelled"]);
     } finally {
@@ -5509,15 +5679,17 @@ Deno.test("serveUi serves the three UI files with content types", async () => {
   }
 });
 
-Deno.test("serveUi returns 404 for anything else", async () => {
-  const response = serveUi(new Request("http://127.0.0.1/settings.json"));
-  assertEquals(response.status, 404);
-  await response.body?.cancel();
+Deno.test("serveUi returns 404 for anything else, including inherited property names", async () => {
+  for (const path of ["/settings.json", "/constructor", "/toString", "/__proto__", "/hasOwnProperty"]) {
+    const response = serveUi(new Request(`http://127.0.0.1${path}`));
+    assertEquals(response.status, 404, path);
+    await response.body?.cancel();
+  }
 });
 
 Deno.test("every element id used by app.js exists in index.html", () => {
-  const html = UI_ASSETS["/"].body;
-  const js = UI_ASSETS["/app.js"].body;
+  const html = UI_ASSETS.get("/")!.body;
+  const js = UI_ASSETS.get("/app.js")!.body;
   const ids = [...js.matchAll(/(?:\$|setText|setHidden|showError)\("([\w-]+)"/g)].map((match) => match[1]);
   assert(new Set(ids).size > 30, "expected app.js to reference many elements");
   for (const id of new Set(ids)) assertStringIncludes(html, `id="${id}"`, `missing #${id}`);
@@ -5539,7 +5711,7 @@ Deno.test("app.js only calls bindings that main.ts registers", () => {
     "reset",
     "revealInFinder",
   ];
-  const js = UI_ASSETS["/app.js"].body;
+  const js = UI_ASSETS.get("/app.js")!.body;
   const used = new Set([...js.matchAll(/bindings\.(\w+)\(/g)].map((match) => match[1]));
   assertEquals(used.size, registered.length, `app.js uses ${[...used].join(", ")}`);
   for (const name of used) assert(registered.includes(name), `unregistered binding ${name}`);
@@ -5555,11 +5727,13 @@ import indexHtml from "../ui/index.html" with { type: "text" };
 import appJs from "../ui/app.js" with { type: "text" };
 import styleCss from "../ui/style.css" with { type: "text" };
 
-export const UI_ASSETS: Record<string, { body: string; contentType: string }> = {
-  "/": { body: indexHtml, contentType: "text/html; charset=utf-8" },
-  "/app.js": { body: appJs, contentType: "text/javascript; charset=utf-8" },
-  "/style.css": { body: styleCss, contentType: "text/css; charset=utf-8" },
-};
+// A Map, not a plain object: paths like /constructor must not resolve to
+// inherited properties.
+export const UI_ASSETS = new Map<string, { body: string; contentType: string }>([
+  ["/", { body: indexHtml, contentType: "text/html; charset=utf-8" }],
+  ["/app.js", { body: appJs, contentType: "text/javascript; charset=utf-8" }],
+  ["/style.css", { body: styleCss, contentType: "text/css; charset=utf-8" }],
+]);
 
 export function serveUi(_request: Request): Response {
   return new Response("");
@@ -6150,8 +6324,12 @@ function renderExtracting(status) {
 
 function renderPreview(status) {
   const entering = ui.screen !== "preview";
+  // Back from the processing screen (overwrite confirmation or destination
+  // failure): keep the filename the user typed.
+  const fromProcessing = ui.screen === "processing";
   showScreen("preview");
-  showError("preview-error", status.lastError ?? null);
+  // Do not wipe an error shown by an action while staying on this screen.
+  if (entering || status.lastError) showError("preview-error", status.lastError ?? null);
   const body = $("info-table").querySelector("tbody");
   body.replaceChildren();
   const addRow = (label, value) => {
@@ -6169,8 +6347,8 @@ function renderPreview(status) {
   }
   addRow("主檔大小", formatBytes(status.mainSize));
   addRow("輔助檔大小", formatBytes(status.auxSize));
-  // Keep what the user typed when re-rendering the same screen.
-  if (entering) $("filename").value = status.defaultFilename;
+  // Keep what the user typed when re-rendering or returning from processing.
+  if (entering && !fromProcessing) $("filename").value = status.defaultFilename;
   const ffmpegOk = ui.tools ? ui.tools.ffmpeg.ok : true;
   $("start-button").disabled = !ffmpegOk;
   setHidden("tool-warning", ffmpegOk);
@@ -6182,12 +6360,17 @@ async function startProcessing() {
   try {
     let confirmed = null;
     for (;;) {
+      // Poll while the binding is pending: destination checks can be slow,
+      // and the processing screen (with its cancel button) must show at once.
+      startPolling();
       const result = await bindings.startProcess(filename, confirmed);
       if (!result.needsConfirm) break;
+      await refresh(); // Back to the preview behind the confirmation dialog.
       if (!confirm(`檔案已存在，要覆蓋嗎？\n${result.finalPath}`)) return;
       confirmed = result.finalPath;
     }
   } catch (error) {
+    await refresh();
     showError("preview-error", error);
     return;
   }
@@ -6372,6 +6555,9 @@ globalThis.__showShuttingDown = () => {
 function wire() {
   $("open-settings").addEventListener("click", () => void openSettings());
   $("settings-close").addEventListener("click", () => $("settings-dialog").close());
+  // Closing settings by any means (button, Escape, save) reconciles the
+  // current screen, e.g. the start button after a tool re-check.
+  $("settings-dialog").addEventListener("close", () => void refresh());
   $("settings-save").addEventListener("click", () => void saveSettingsFromForm());
   $("probe-retry").addEventListener("click", () => startProbing());
   $("connect-button").addEventListener("click", () => void connect());
@@ -6404,7 +6590,7 @@ Expected: the two consistency tests (element ids, bindings) now PASS; the two `s
 ```ts
 /** Serves `/`, `/app.js`, `/style.css`; everything else is 404. */
 export function serveUi(request: Request): Response {
-  const asset = UI_ASSETS[new URL(request.url).pathname];
+  const asset = UI_ASSETS.get(new URL(request.url).pathname);
   if (!asset) return new Response("Not Found", { status: 404 });
   return new Response(asset.body, { headers: { "content-type": asset.contentType } });
 }
@@ -6483,8 +6669,11 @@ win.bind("saveSettings", async (next: Settings) => {
     ffmpegPath: String(next.ffmpegPath).trim(),
     ffprobePath: String(next.ffprobePath).trim(),
   };
+  // Refuse before touching the file (e.g. a CDP address change while extracting).
+  job.assertSettingsChangeAllowed(candidate);
   await saveSettings(candidate);
   settings = candidate;
+  // A changed CDP address drops the current browser connection.
   job.updateSettings(candidate);
   return { tools: await checkTools(candidate) };
 });
@@ -6688,10 +6877,11 @@ Then run `deno task build`.
   5. Pick a never-opened (dormant) tab → about 3 s later "分頁尚未載入"; open that tab in Brave and retry → success.
   6. During processing click 取消 → no file in the output folder; `ls "$TMPDIR" | grep ffdl-` shows no dir for this job.
   7. Quit the app with Cmd+Q, set `PROBE_DURATION = false` in `user/config.ts`, run `deno task build`, relaunch with `open dist/TabRipper.app`, connect and process → indeterminate progress bar with elapsed time; the ffmpeg status line (`frame=`/`size=`…) is shown under the bar. Quit with Cmd+Q, set it back to `true`, run `deno task build`, relaunch for the remaining items.
-  8. During processing press Cmd+Q → "正在結束…" overlay, app quits within a few seconds; `pgrep -fl ffmpeg` shows nothing; `ls "$TMPDIR" | grep ffdl-` shows no dir from this run.
-  9. During processing click the window close button → app quits immediately; `pgrep -fl ffmpeg` shows nothing; relaunch the app, then `ls "$TMPDIR" | grep ffdl-` shows the leftover is gone.
+  8. During processing, first run `pgrep -fl ffdl-` and record the app's ffmpeg PID (its command line contains the `ffdl-<session>` temp path, so unrelated ffmpeg jobs are not matched). Press Cmd+Q → "正在結束…" overlay, app quits within a few seconds; `ps -p <PID>` reports no such process; `ls "$TMPDIR" | grep ffdl-` shows no dir from this run.
+  9. During processing, record the ffmpeg PID the same way, then click the window close button → app quits immediately; `ps -p <PID>` reports no such process; relaunch the app, then `ls "$TMPDIR" | grep ffdl-` shows the leftover is gone.
   10. All of the above were run from `dist/TabRipper.app` built by `deno task build`.
   11. During processing, open 設定 and press Cmd+Q while the settings dialog is open → the dialog closes and the full-screen "正在結束…" overlay is visible before the app quits.
+  12. While connected on the tab list, change 設定 › CDP 位址 to `127.0.0.1:9223` and save → the app shows the connect screen (connection dropped); set it back to `127.0.0.1:9222`, click 連線 → Brave asks for permission again and the tab list returns.
 
   Use a distinct output filename for each item, and before each cancellation/quit check note the job's temp dir (`ls -d "$TMPDIR"/ffdl-*`) so earlier runs do not confuse the cleanup checks.
 
@@ -6699,4 +6889,8 @@ Then run `deno task build`.
 
 - [ ] **Step 4: Restore the user files** — with the `BACKUP` path recorded in Step 1: `cp "$BACKUP"/* user/`, then `diff -r "$BACKUP" user/` prints nothing; only then remove the backup with `rm -r "$BACKUP"`.
 
-- [ ] **Step 5: Final gate** — `deno task check && deno task lint && deno fmt --check && deno task test && deno task build` all succeed on the restored tree.
+- [ ] **Step 5: Final gate** — the automated suite assumes the committed default `user/` files (example.com pattern, `Clip.mp4` default name, duration probing on). Run it against those defaults even if the restored `user/` files are customised:
+  1. If `git status --short user/` prints anything, run `git stash push -- user/` (version-control operation; it parks the user's customisations).
+  2. Run `deno task check && deno task lint && deno fmt --check && deno task test` — all must pass.
+  3. If you stashed in 1., run `git stash pop`, then `git status --short user/` shows the user's changes again.
+  4. Run `deno task check && deno task build` on the user's configuration — both must succeed.
