@@ -222,11 +222,10 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
 
 1. `Target.attachToTarget { targetId, flatten: true }` 取得 `sessionId`；同時以 `client.on("Target.detachedFromTarget", ...)` 監聽，若收到相同 `sessionId` 的事件，標記中止，後續步驟以 `ExtractError("分頁已關閉或已中斷偵錯連線")` 結束。
    - **存活檢查**：attach 後先以 `Runtime.evaluate { expression: "1", returnByValue: true }`、逾時 **3 秒**確認分頁有可執行 JS 的 renderer。逾時 → `ExtractError("分頁尚未載入（可能被瀏覽器休眠），請先在瀏覽器點開該分頁後再試一次")`，不執行使用者腳本（見 §3.1 實測：休眠分頁的 evaluate 永不回應）。
-2. 每次擷取產生唯一的 `token`（`crypto.randomUUID()`）。頁面端所有資料都放在 `window.__ffdl[token]`，取消標記放在 `window.__ffdl_cancelled[token]`；wrapper 開頭以 `window.__ffdl ??= {}`、`window.__ffdl_cancelled ??= {}` 初始化兩者，清理運算式也以同樣方式初始化，因此在全新頁面上也不會因屬性不存在而丟錯。不同擷取之間互不覆寫。
+2. 每次擷取產生唯一的 `token`（`crypto.randomUUID()`）。頁面端資料放在 `window.__ffdl[token]`（wrapper 開頭以 `window.__ffdl ??= {}` 初始化），不同擷取之間互不覆寫、分塊讀取不會讀到別次擷取的資料。**不做頁面端清理**：資料保留在分頁中直到重新整理（見 §10）。
 3. 以 `Runtime.evaluate`（`awaitPromise: true, returnByValue: true`，帶 `sessionId`，逾時 **300 秒**，因為使用者腳本可能需要下載資料）執行 wrapper 運算式：
    - **頁面身分檢查**：呼叫使用者腳本**之前**，在同一個運算式中以 `URL_PATTERN` 的 `source` 與（去除 `g`/`y` 的）`flags` 重建 RegExp，檢查目前的 `location.href`；不符合時丟出例外「分頁網址已變更為 <href>，不符合網址規則，請重新選擇分頁」，不執行使用者腳本。只比對 `URL_PATTERN` 而不要求與列表時的網址完全相同，因為 SPA 常改變 hash 或 query 而仍是同一個目標頁。之後的分塊讀取以 token 綁定頁面狀態，若頁面在腳本執行後導頁，`window.__ffdl[token]` 會消失而依步驟 5 失敗。
    - 以 `(${pageScript.toString()})()` 呼叫使用者腳本。
-   - 腳本完成後，若 `window.__ffdl_cancelled[token]` 為 true（此次擷取已被 Deno 端放棄），丟棄結果、不寫入 `window.__ffdl[token]`，並刪除該標記。
    - 驗證 `main`、`aux` 為 `ArrayBuffer` 或 `ArrayBufferView`，轉成 `Uint8Array` 存入 `window.__ffdl[token] = { main, aux }`。
    - 驗證 `info` 為純物件、值只能是 string/number/boolean，否則丟出例外。
    - 回傳 `{ info, sizes: { main, aux } }`。
@@ -237,10 +236,8 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
    - Deno 端以 `Uint8Array.fromBase64()` 解碼後，依序寫入 `<tempDir>/main.bin`、`<tempDir>/aux.bin`，每寫完一塊呼叫 `onProgress(累計位元組, main+aux 總位元組)`。
 6. 寫完後比對檔案大小與 `sizes`，不符 → `ExtractError`。
 7. `finally`（有時間上限，不讓失敗路徑拖長）：
-   - 若存活檢查失敗或 session 已 detach → **跳過**頁面端清理（renderer 不會回應）。
-   - 否則盡力（錯誤忽略、逾時 **3 秒**）以一個運算式依序執行彼此獨立的步驟（各自包在 `try` 中，任一步失敗不影響其他步）：初始化 `window.__ffdl ??= {}` 與 `window.__ffdl_cancelled ??= {}`、`delete window.__ffdl[token]`，並且**只有在步驟 3 的 wrapper 尚未回傳結果時**（逾時、傳輸失敗）才設定 `window.__ffdl_cancelled[token] = true`。取消標記的生命週期：wrapper 中的使用者腳本完成時若看到自己的標記，便丟棄結果並 `delete window.__ffdl_cancelled[token]`。因此成功的擷取不會留下標記；被放棄的擷取在其腳本最終完成時移除標記（腳本永遠不完成時，標記殘留到分頁重新載入，見 §10）；如此一來，逾時後才完成的使用者腳本不會留下資料，也不會影響其他擷取。
-   - 不論上一步結果，獨立送出 `Target.detachFromTarget`（錯誤忽略、逾時 **3 秒**），最後取消事件監聽。
-   - 因此任何擷取失敗從觸發原因到進入 failed(extract) 最多再延遲約 6 秒；分頁關閉時進行中的請求由 §6.4 的 session reject 立即結束，不需等待 300 秒逾時。
+   - session 尚未 detach 時送出 `Target.detachFromTarget`（錯誤忽略、逾時 **3 秒**），最後取消事件監聽。不送任何頁面端清理運算式。
+   - 因此任何擷取失敗從觸發原因到進入 failed(extract) 最多再延遲約 3 秒；分頁關閉時進行中的請求由 §6.4 的 session reject 立即結束，不需等待 300 秒逾時。
 - 大小為 0 的檔案合法（寫出空檔、不發 read 請求）。
 
 ### 6.7 `filename.ts`
@@ -453,7 +450,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - **純函式單元測試**：`parseCdpAddress`（正常、前後空白、缺 port、port 非數字或超出範圍、host 為空或含 `/`）、`browserWsUrl`（回傳 `ws://host:port/devtools/browser`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
-- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、頁面身分檢查（假 server 依送來的 wrapper 運算式回傳「網址不符」的 `exceptionDetails` 時，`extractFromTab` 以該訊息失敗；並以純函式單元測試驗證 wrapper 產生器把 `URL_PATTERN` 的 source/flags 正確嵌入且去除 `g`/`y`；另在測試中以 Deno 直接 `eval` 產生的 wrapper 檢查片段，對符合與不符合的 `location.href` 樣本驗證行為）、存活檢查（假 server 對所有 evaluate 都不回應時：不送出使用者腳本與頁面端清理運算式，且從 `extractFromTab` 呼叫到 reject 的總耗時小於 7 秒——3 秒存活檢查 + 最多 3 秒 detach）、使用者腳本請求懸置中假 server 發出 `Target.detachedFromTarget` 時，`extractFromTab` 在 1 秒內以分頁已關閉的錯誤結束、client 對該 session 的 pending 請求以 `CdpSessionClosedError` reject，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。另以 Deno 直接 `eval` 實際產生的 wrapper 與清理運算式（以一個模擬 `window` 的全新空物件作為 `globalThis.window`）驗證：全新頁面上清理不會丟錯且 buffer 被刪除；連續兩次成功擷取後 `window.__ffdl` 與 `window.__ffdl_cancelled` 都不殘留任何 token；wrapper 未回傳時執行的清理會設定標記，之後才完成的使用者腳本不會寫入 `window.__ffdl[token]`，且完成後標記被移除。
+- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、頁面身分檢查（假 server 依送來的 wrapper 運算式回傳「網址不符」的 `exceptionDetails` 時，`extractFromTab` 以該訊息失敗；並以純函式單元測試驗證 wrapper 產生器把 `URL_PATTERN` 的 source/flags 正確嵌入且去除 `g`/`y`；另在測試中以 Deno 直接 `eval` 產生的 wrapper 檢查片段，對符合與不符合的 `location.href` 樣本驗證行為）、存活檢查（假 server 對所有 evaluate 都不回應時：不送出使用者腳本，且從 `extractFromTab` 呼叫到 reject 的總耗時小於 7 秒——3 秒存活檢查 + 最多 3 秒 detach）、使用者腳本請求懸置中假 server 發出 `Target.detachedFromTarget` 時，`extractFromTab` 在 1 秒內以分頁已關閉的錯誤結束、client 對該 session 的 pending 請求以 `CdpSessionClosedError` reject，以及每次擷取使用不同 token、讀取運算式只讀該 token 的資料、`finally` 只送 `Target.detachFromTarget` 而不送任何頁面端運算式。另以 Deno 直接 `eval` 實際產生的 wrapper（以一個模擬 `window` 的全新空物件作為 `globalThis.window`）驗證：在全新頁面上不會因 `window.__ffdl` 不存在而丟錯；連續兩次擷取分別存入各自的 token、互不覆寫。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、目的地失敗（`outputDir` 指向一個無法建立的路徑，例如其上層是一般檔案；檔名超過 255 位元組導致存在檢查丟出非 NotFound 錯誤；發佈時目標資料夾已被移除寫入權限）時狀態回到 ready 並帶 `lastError`、main/aux 保留、`<tempDir>/out/` 已刪除，之後把 `outputDir` 改成可寫入的資料夾再呼叫 `startProcess` 能成功完成、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
@@ -489,7 +486,10 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - 檔案大小以「數十 MB 以內」為設計目標；未針對 GB 級檔案最佳化（仍以 4 MiB 分塊、串流寫檔，不會整檔載入 Deno 記憶體，但頁面端需同時持有兩個 buffer）。
 - UI 只提供繁體中文。
 - 無法攔截的結束方式（視窗關閉鈕、Dock 右鍵「結束」、強制結束、當機、斷電）不保證收尾：可能殘留暫存目錄與 `.part` 檔，由下次啟動清理；若期間修改過 `outputDir`，舊資料夾中的 `.part` 不會被清理。
-- 擷取中結束程式時 CDP 連線直接關閉，頁面端 `window.__ffdl[token]` 可能殘留到該分頁重新載入為止；被放棄且永遠不完成的使用者腳本，其 `window.__ffdl_cancelled[token]` 標記（一個布林值）同樣殘留到重新載入。
+- **不做頁面端清理**
+  - Concern：擷取完成（或失敗、逾時後腳本才完成）時，`window.__ffdl[token]` 中的 main/aux buffer（各可能數十 MB）會留在分頁記憶體中；同一分頁多次擷取會累積。
+  - Decision：不清理（不送 delete 運算式、不使用取消標記）。
+  - Rationale：使用者裁決；通常每個網頁只擷取一次，即使累積，重新整理分頁即可釋放，不值得為此維護清理與取消標記的生命週期。
 - **輸出檔撞名競態**
   - Concern：使用者選擇不覆蓋（或確認時檔案不存在）之後，若 ffmpeg 處理期間有其他程式在輸出資料夾建立同名檔，最後發佈時的 rename 會靜默取代該檔。
   - Decision：不實作（不使用「不取代」的原子發佈、不在撞名時保留成品重新詢問）。
