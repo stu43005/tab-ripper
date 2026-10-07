@@ -25,7 +25,7 @@
 以下行為已經過 research 驗證（詳見專案 MEMORY）：
 
 1. **`deno desktop`**：單一行程；UI 由入口程式的 `Deno.serve()` 提供，啟動視窗自動導向該位址；`new Deno.BrowserWindow(opts)` 首次建構時接管啟動視窗；`win.bind(name, fn)` 註冊後，頁面端以 `await bindings.name(...)` 呼叫，參數與回傳值以 JSON 編碼。權限旗標在建置時寫入執行檔。沒有原生檔案/資料夾選擇器；`alert`/`confirm`/`prompt` 為原生對話框。預設 backend 為 OS webview（macOS：WKWebView）。
-2. **`chrome://inspect/#remote-debugging`（Chrome M144+；Brave 同樣支援，且 Brave 也能開啟 `chrome://` 網址）**：使用者在此頁開啟開關後，瀏覽器會在 user data dir 根目錄寫入 `DevToolsActivePort`（第一行為 port、第二行為 path，例如 `/devtools/browser/<id>`），browser WebSocket 位址為 `ws://127.0.0.1:${port}${path}`（依 ChromeDevTools/chrome-devtools-mcp 的 `src/BrowserManager.ts`）。此模式下 `/json/version` 等 HTTP 探索端點回 404。每次建立新的偵錯連線，瀏覽器會跳出授權對話框。
+2. **`chrome://inspect/#remote-debugging`（Chrome M144+；Brave 同樣支援，且 Brave 也能開啟 `chrome://` 網址）**：使用者在此頁開啟開關後，頁面會顯示偵錯伺服器位址（預設 `127.0.0.1:9222`）。此模式下 `/json/version` 等 HTTP 探索端點回 404；browser WebSocket 端點為 `ws://<位址>/devtools/browser`（§3.1 實測不需 uuid）。瀏覽器另會在 user data dir 寫入 `DevToolsActivePort`，但本程式**不讀取**（macOS 讀取其他 App 資料夾需額外權限）。每次建立新的偵錯連線，瀏覽器會跳出授權對話框。
 3. **CDP 方法**：`Target.getTargets` → `{ targetInfos: [{ targetId, type, title, url, ... }] }`；`Target.attachToTarget { targetId, flatten: true }` → `{ sessionId }`；之後的指令在訊息頂層帶 `sessionId`；`Runtime.evaluate { expression, awaitPromise: true, returnByValue: true }` 結果在 `result.value`，例外在 `exceptionDetails`；`Target.detachFromTarget { sessionId }`；分頁關閉時 browser 端會收到 `Target.detachedFromTarget { sessionId }` 事件。
 4. **Deno 2.9.7**：原生支援 `Uint8Array.fromBase64()` / `Uint8Array.prototype.toBase64()`；支援 `import x from "./a.html" with { type: "text" }`（不需 unstable 旗標），可用來把 UI 檔案編入模組圖；從 `.js` 模組匯出的函式，其 `toString()` 會回傳原始碼。
 5. **測試用套件**：`jsr:@std/assert@1.0.19`（`assertEquals`、`assertThrows`、`assertRejects`）、`jsr:@std/path@1.1.6`（`join`、`dirname`、`basename`）。
@@ -39,6 +39,7 @@
 | A1：只做 TCP 連線不會觸發授權對話框 | ✅ 成立（使用者目視確認） |
 | A2：toggle 模式埠為 `127.0.0.1:9222`，與 `DevToolsActivePort` 一致 | ✅ 成立（Brave；瀏覽器未帶 `--remote-debugging-port` 啟動參數） |
 | A3：Deno 原生 `WebSocket`（不設 Origin）可連線 | ✅ 成立（含使用者按允許約 1.5 秒） |
+| A7：不需 uuid 即可連 browser endpoint | ✅ 成立：`/devtools/browser`、`/devtools/browser/`、任意 uuid 皆可連線，`Browser.getVersion` 回應 `Chrome/154.0.8037.58`；`/` 回 HTTP 403 |
 | A4：`bindings` 與 text import 的 UI 在 `--hmr` 與建置產物中正常 | ✅ 成立 |
 | A5：`getTargets` / `attachToTarget`(flatten) / `Runtime.evaluate` 可用 | ✅ 成立；頁面端有 `Uint8Array.prototype.toBase64`，4 MiB base64 往返約 415 ms |
 | A6a：視窗 `close` 事件可 `preventDefault()` | ❌ **不成立**。`e.cancelable === false`，視窗立即關閉。v2.9.7 原始碼 `cli/rt_desktop/lib.rs:223-227` 明寫 close 事件只是通知、不可取消（官方文件與實作不符） |
@@ -63,7 +64,7 @@ ffmpeg-downloader/
 │  ├─ types.ts            # 共用型別：Settings、TabInfo、JobStatus、ExtractResult 等
 │  ├─ settings.ts         # 設定檔讀寫與預設值
 │  ├─ cdp/probe.ts        # TCP 探測 CDP 埠是否開啟
-│  ├─ cdp/discovery.ts    # 解析 DevToolsActivePort、決定 browser WS URL
+│  ├─ cdp/address.ts      # 解析 CDP 位址、組 browser WS URL
 │  ├─ cdp/client.ts       # 精簡 CDP client
 │  ├─ tabs.ts             # 列出並過濾分頁
 │  ├─ extract.ts          # 在分頁執行頁面腳本、分塊取回檔案寫入暫存目錄
@@ -161,32 +162,25 @@ export function buildFfmpegArgs(ctx: FfmpegArgsContext): string[] {
 
 | 欄位 | 預設 | 說明 |
 | --- | --- | --- |
-| `cdpAddress` | `127.0.0.1:9222` | CDP 主機:埠，用於 TCP 探測與組 WS URL |
-| `cdpWsUrl` | `""` | 完整 browser WS URL；非空時直接使用，忽略 `DevToolsActivePort` |
-| `browserUserDataDir` | `""`（自動偵測） | 讀取 `DevToolsActivePort` 的瀏覽器 user data dir；空字串表示依 §6.3 自動偵測 |
+| `cdpAddress` | `127.0.0.1:9222` | CDP 主機:埠（即 `chrome://inspect/#remote-debugging` 頁面上顯示的位址），用於 TCP 探測與組 WS URL；與頁面顯示不同時由使用者修改 |
 | `outputDir` | `$HOME/Downloads` | 成品輸出資料夾 |
 | `ffmpegPath` | `ffmpeg` | 可為 PATH 中的名稱或絕對路徑 |
 | `ffprobePath` | `ffprobe` | 同上 |
 
 - `loadSettings(): Promise<{ settings: Settings; warning?: string }>`：檔案不存在 → 全部預設值；JSON 損毀 → 預設值並回傳 warning（設定頁顯示）；部分欄位缺漏或型別不符 → 該欄位用預設值。
-- `saveSettings(s: Settings): Promise<void>`：驗證 `cdpAddress` 格式為 `host:port`（port 1–65535）、`cdpWsUrl` 為空或以 `ws://`/`wss://` 開頭；不合法時丟出錯誤、不寫檔。寫入前確保目錄存在。
+- `saveSettings(s: Settings): Promise<void>`：以 §6.3 `parseCdpAddress` 驗證 `cdpAddress`；不合法時丟出錯誤、不寫檔。寫入前確保目錄存在。
 
 ### 6.2 `cdp/probe.ts`
 
 - `probeCdpPort(address: string, timeoutMs = 1000): Promise<boolean>`：以 `Deno.connect({ hostname, port })` 建立 TCP 連線，成功即立刻 `close()` 並回傳 `true`；連線被拒或逾時回傳 `false`。**不送出任何資料、不做 WebSocket handshake**（§3.1 A1 實測：不會觸發授權對話框）。
-- `probeTarget(settings: Settings): string`：決定探測位址。`cdpWsUrl` 非空時取其 URL 的 `host:port`（無明確 port 時 `ws://` 用 80、`wss://` 用 443）；否則用 `cdpAddress`。`probe` binding 一律探測此位址，因此探測結果與 `connect()` 實際連線的目標一致。
+- `probe` binding 與 `connect()` 都使用同一個 `cdpAddress`，因此探測結果與實際連線目標一致。
 
-### 6.3 `cdp/discovery.ts`
+### 6.3 `cdp/address.ts`
 
-- `parseDevToolsActivePort(content: string): { port: number; path: string }`：以 `\n` 分行、trim、去除空行；需同時有 port 與 path，port 為 1–65535 整數，path 以 `/` 開頭，否則丟出 `DiscoveryError`。
-- `resolveBrowserWsUrl(settings: Settings): Promise<string>`：
-  1. `cdpWsUrl` 非空 → 直接回傳。
-  2. 決定候選 user data dir：
-     - `browserUserDataDir` 非空 → 只用該路徑。
-     - 空字串（自動偵測）→ 依序使用 `$HOME/Library/Application Support/BraveSoftware/Brave-Browser`、`$HOME/Library/Application Support/Google/Chrome`（兩者路徑皆已實際確認；其他瀏覽器請在設定手動填寫）。
-  3. 依序讀取每個候選的 `DevToolsActivePort` 並解析；採用**第一個**檔案存在、解析成功且 port 等於 `cdpAddress` port 的候選。
-  4. 沒有候選可用 → `DiscoveryError`，訊息列出每個已檢查的路徑及原因（檔案不存在／格式錯誤／port 為 X 與 `cdpAddress` 的 Y 不符），並提示「請確認已在 `chrome://inspect/#remote-debugging` 開啟遠端偵錯，或在設定指定瀏覽器資料夾／填寫 CDP WebSocket URL」。
-  5. 回傳 `ws://${cdpAddress 的 host}:${port}${path}`。
+**不讀取瀏覽器的資料夾**（例如 `DevToolsActivePort`；macOS 讀取其他 App 的 Application Support 需要額外權限），只依使用者設定的 `cdpAddress` 連線。
+
+- `parseCdpAddress(address: string): { host: string; port: number }`：trim 後須為 `host:port`，host 非空、不含 `/` 與空白，port 為 1–65535 整數；否則丟出錯誤「CDP 位址格式應為 主機:埠，例如 127.0.0.1:9222」。
+- `browserWsUrl(address: string): string`：回傳 `ws://${host}:${port}/devtools/browser`。§3.1 實測：toggle 模式下 browser endpoint 不需要 `DevToolsActivePort` 中的 uuid，`/devtools/browser` 即可建立瀏覽器層級的連線（`/` 會回 403）。
 
 ### 6.4 `cdp/client.ts`
 
@@ -328,7 +322,7 @@ type JobStatus =
 CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - 持有 `client: CdpClient | null` 與 `connecting: Promise<void> | null`；`connected` 即 `client !== null`。
-- `connect()`：已連線 → 直接回傳；`connecting` 非 null → 回傳同一個 Promise（重疊呼叫共用同一次連線嘗試，不會重複觸發授權對話框）；否則**同步**設定 `connecting` 後才開始 `resolveBrowserWsUrl` 與 `CdpClient.connect`，結束時（成功或失敗）清空 `connecting`。
+- `connect()`：已連線 → 直接回傳；`connecting` 非 null → 回傳同一個 Promise（重疊呼叫共用同一次連線嘗試，不會重複觸發授權對話框）；否則**同步**設定 `connecting` 後才以 `browserWsUrl(cdpAddress)` 呼叫 `CdpClient.connect`，結束時（成功或失敗）清空 `connecting`。
 - 連線成功時若 `shuttingDown` 已為 true，立即關閉該 client 並以「程式正在結束」失敗。
 - `client.closed` 的處理函式綁定該 client 實例：只有在 `this.client === 該 client` 時才把 `client` 設為 null，避免舊連線的關閉事件誤把新連線標成中斷。
 - 連線關閉時，若當下為 extracting，該次擷取以失敗結束。
@@ -406,7 +400,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 也就是說，連線中斷**不會**讓預覽、處理中、結果畫面消失：ready 的工作仍可開始處理（處理只用暫存檔，不需要 CDP），處理中的工作仍可取消，結果仍可查看；直到工作回到 idle（`discard()` 或 `reset()`）時，才依 `connected` 決定回到連線畫面或分頁清單。UI 在 extracting / processing 期間每 250 ms 輪詢 `getStatus()`，其他畫面在每次操作後呼叫 `getStatus()` 與 `getConnection()` 重新決定畫面。
 
-1. **連線**：進入時呼叫 `probe()`（探測位址見 §6.2 `probeTarget`），埠未開啟時每 2 秒自動重探。
+1. **連線**：進入時呼叫 `probe()`（探測 `cdpAddress`），埠未開啟時每 2 秒自動重探。
    - 未開啟：引導文字「請在瀏覽器網址列開啟 `chrome://inspect/#remote-debugging` 並打開遠端偵錯開關（Brave 也可直接使用此網址）」＋目前探測位址＋「重試」與「設定」。
    - 已開啟：顯示「偵測到瀏覽器偵錯埠」與「連線」按鈕；按下才呼叫 `connect()`，並提示「請在瀏覽器跳出的對話框按允許」。連線失敗顯示錯誤訊息並留在此畫面。
 2. **分頁清單**：`listTabs()` 結果（標題、URL），可「重新整理」；無符合分頁時顯示空狀態與目前的 `URL_PATTERN`。點選分頁 → `extract()`。
@@ -433,7 +427,8 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 | 情境 | 行為 |
 | --- | --- |
 | CDP 埠未開啟 | 連線畫面引導 + 自動重探 |
-| `DevToolsActivePort` 不存在 / 格式錯誤 / port 不符 | `connect()` 失敗，顯示 §6.3 的訊息 |
+| `cdpAddress` 格式錯誤 | `saveSettings` 拒絕儲存，顯示 §6.3 的訊息 |
+| 埠有開但 WebSocket 連線失敗（例如位址指向其他服務） | `connect()` 失敗，顯示錯誤並提示確認 `chrome://inspect/#remote-debugging` 頁面上的位址與設定一致 |
 | 使用者在瀏覽器拒絕授權或逾時 | `connect()` 失敗，提示可再試 |
 | 選到休眠或尚未載入的分頁 | 3 秒存活檢查逾時 → failed(extract)，提示先在瀏覽器點開該分頁（§6.6） |
 | 視窗關閉鈕 / Cmd+W | 立即結束，只做同步盡力收尾（§6.11 B） |
@@ -451,7 +446,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 使用 `deno test` 與 `jsr:@std/assert`。
 
-- **純函式單元測試**：`parseDevToolsActivePort`（正常、缺第二行、port 非法、path 非 `/` 開頭、多餘空行）、`resolveBrowserWsUrl`（`cdpWsUrl` 優先、指定 `browserUserDataDir` 時只看該路徑、自動偵測時依序選第一個 port 相符的候選、全部失敗時錯誤訊息列出每個路徑與原因；候選路徑以參數覆寫為測試建立的暫存目錄，生產程式的預設候選清單維持 §6.3）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
+- **純函式單元測試**：`parseCdpAddress`（正常、前後空白、缺 port、port 非數字或超出範圍、host 為空或含 `/`）、`browserWsUrl`（回傳 `ws://host:port/devtools/browser`）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
 - **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、存活檢查（假 server 對所有 evaluate 都不回應時：不送出使用者腳本與頁面端清理運算式，且從 `extractFromTab` 呼叫到 reject 的總耗時小於 7 秒——3 秒存活檢查 + 最多 3 秒 detach）、使用者腳本請求懸置中假 server 發出 `Target.detachedFromTarget` 時，`extractFromTab` 在 1 秒內以分頁已關閉的錯誤結束、client 對該 session 的 pending 請求以 `CdpSessionClosedError` reject，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
@@ -464,7 +459,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 - **發佈**（`src/publish.ts`，見 §6.9 步驟 8）：`publishOutput(src, finalPath)` 測試同一磁碟 rename 成功（含覆蓋既有檔）。跨裝置情境在測試環境無法重現，因此把複製分支匯出為 `copyThenRename(src, finalPath)` 直接測試：正常時 `finalPath` 內容等於來源且沒有殘留 `.part`；最終檔名長度為 250 位元組（接近上限的合法檔名）時同樣成功；來源在呼叫前被刪除（模擬複製失敗）時丟出錯誤、沒有殘留 `.part`、既有的 `finalPath` 內容不變。
 - **手動驗收清單**（`deno desktop` 視窗與真實瀏覽器無法自動化；以 Brave 執行）：
   1. 瀏覽器未開開關 → 連線畫面顯示引導；開啟開關後 2 秒內變成「偵測到」，且瀏覽器**未**跳出授權對話框。
-  2. 按連線 → 瀏覽器跳出授權對話框一次；允許後看到分頁清單。設定中 `browserUserDataDir` 留空即可自動找到 Brave。
+  2. 按連線 → 瀏覽器跳出授權對話框一次；允許後看到分頁清單（使用預設 `cdpAddress` 即可連上 Brave）。把 `cdpAddress` 改成錯誤的埠 → 連線畫面顯示未偵測到；改回後恢復。
   3. 完成一次工作後按「再一次」→ 不再跳出授權對話框。
   4. 擷取中關閉該分頁 → 顯示分頁已關閉的錯誤。
   5. 選一個休眠中（未點開過）的分頁 → 約 3 秒後顯示「分頁尚未載入」；點開該分頁後重試成功。
@@ -477,7 +472,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 ## 10. Non-goals / Accepted limitations
 
 - 只支援 macOS（`open -R`、預設路徑皆為 macOS）；不處理 Windows/Linux。
-- user data dir 自動偵測只涵蓋 Brave 與 Google Chrome stable；其他 Chromium 瀏覽器需使用者自行在設定中填寫路徑或 WS URL。
+- 不讀取瀏覽器資料夾、不自動偵測位址；`chrome://inspect/#remote-debugging` 顯示的位址與預設 `127.0.0.1:9222` 不同時，由使用者在設定中修改 `cdpAddress`。
 - **視窗關閉鈕（Cmd+W）無法優雅收尾**
   - Concern：處理中按關閉鈕時無法取消 ffmpeg、等待發佈或清理暫存。
   - Decision：接受立即結束；只做同步盡力收尾（SIGKILL 子行程、`removeSync` 暫存目錄），殘留由下次啟動清理；優雅收尾只提供給 Cmd+Q。
