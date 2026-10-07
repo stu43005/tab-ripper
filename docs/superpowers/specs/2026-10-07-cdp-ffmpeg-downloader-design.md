@@ -206,6 +206,7 @@ class CdpClient {
 - 每個請求預設逾時 60 秒，可由 `send` 的第四個參數 `opts?: { timeoutMs?: number }` 覆寫；逾時以 `CdpTimeoutError` reject 並移除 pending（之後才到達的回應直接丟棄）。
 - 連線建立逾時（預設 60 秒，涵蓋使用者在瀏覽器授權對話框的等待）以 `CdpConnectError` reject。
 - socket 關閉或錯誤 → 所有 pending 以 `CdpClosedError` reject，`closed` resolve，之後的 `send` 立即 reject。
+- 收到 `Target.detachedFromTarget { sessionId }` 事件時，client 內部立即以 `CdpSessionClosedError` reject 所有帶該 `sessionId` 的 pending 請求，之後對該 `sessionId` 的 `send` 也立即 reject（分頁關閉或休眠被卸載時，不必等到逾時）。
 - **整個 App 生命週期只建立一條 browser 連線**（由 `job.ts` 持有），避免重複觸發授權對話框；連線關閉後必須由使用者再次按「連線」才會重建。
 
 ### 6.5 `tabs.ts`
@@ -238,7 +239,11 @@ extractFromTab(client: CdpClient, targetId: string, tempDir: string,
    - 若 `window.__ffdl?.[token]` 不存在（頁面重新載入或導頁）→ `ExtractError("頁面資料遺失，分頁可能已重新載入")`。
    - Deno 端以 `Uint8Array.fromBase64()` 解碼後，依序寫入 `<tempDir>/main.bin`、`<tempDir>/aux.bin`，每寫完一塊呼叫 `onProgress(累計位元組, main+aux 總位元組)`。
 6. 寫完後比對檔案大小與 `sizes`，不符 → `ExtractError`。
-7. `finally`：盡力（錯誤忽略）以一個運算式同時設定 `window.__ffdl_cancelled[token] = true` 並 `delete window.__ffdl[token]`，接著 `Target.detachFromTarget`，最後取消事件監聽。如此一來，逾時後才完成的使用者腳本不會留下資料，也不會影響其他擷取。
+7. `finally`（有時間上限，不讓失敗路徑拖長）：
+   - 若存活檢查失敗或 session 已 detach → **跳過**頁面端清理（renderer 不會回應）。
+   - 否則盡力（錯誤忽略、逾時 **3 秒**）以一個運算式同時設定 `window.__ffdl_cancelled[token] = true` 並 `delete window.__ffdl[token]`；如此一來，逾時後才完成的使用者腳本不會留下資料，也不會影響其他擷取。
+   - 不論上一步結果，獨立送出 `Target.detachFromTarget`（錯誤忽略、逾時 **3 秒**），最後取消事件監聽。
+   - 因此任何擷取失敗從觸發原因到進入 failed(extract) 最多再延遲約 6 秒；分頁關閉時進行中的請求由 §6.4 的 session reject 立即結束，不需等待 300 秒逾時。
 - 大小為 0 的檔案合法（寫出空檔、不發 read 請求）。
 
 ### 6.7 `filename.ts`
@@ -442,7 +447,7 @@ CDP 連線狀態（與 job 分開管理，同樣由 `job.ts` 模組持有）：
 
 - **純函式單元測試**：`parseDevToolsActivePort`（正常、缺第二行、port 非法、path 非 `/` 開頭、多餘空行）、`resolveBrowserWsUrl`（`cdpWsUrl` 優先、指定 `browserUserDataDir` 時只看該路徑、自動偵測時依序選第一個 port 相符的候選、全部失敗時錯誤訊息列出每個路徑與原因；候選路徑以參數覆寫為測試建立的暫存目錄，生產程式的預設候選清單維持 §6.3）、URL 過濾（含 `g` 旗標的 regex 連續比對結果一致）、`sanitizeFilename`、`parseProgress`（`out_time_us`、`N/A`、`speed`、`progress=end`、跨 chunk 截斷）、設定檔載入（不存在、損毀、部分欄位）。
 - **TCP 探測**：對測試中以 `Deno.listen` 開啟的埠回傳 true；對已關閉的埠回傳 false。
-- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、存活檢查（假 server 對 `"1"` 不回應時 3 秒內以「分頁尚未載入」失敗，且不送出使用者腳本），以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
+- **CDP client 與擷取**：測試內以 `Deno.serve` + `Deno.upgradeWebSocket` 建立本機假 CDP server，驗證：`id` 對應與亂序回應、`sessionId` 路由、錯誤回應轉成 `CdpError`、逾時、socket 關閉時 pending 全部 reject；`extractFromTab` 在假 server 模擬 `Runtime.evaluate` 回應下正確寫出檔案（含 0 位元組與跨多塊的檔案）、處理 `exceptionDetails`、處理 `Target.detachedFromTarget` 中止、存活檢查（假 server 對所有 evaluate 都不回應時：不送出使用者腳本與頁面端清理運算式，且從 `extractFromTab` 呼叫到 reject 的總耗時小於 7 秒——3 秒存活檢查 + 最多 3 秒 detach）、使用者腳本請求懸置中假 server 發出 `Target.detachedFromTarget` 時，`extractFromTab` 在 1 秒內以分頁已關閉的錯誤結束、client 對該 session 的 pending 請求以 `CdpSessionClosedError` reject，以及每次擷取使用不同 token、`finally` 送出的清理運算式只針對該 token。
 - **ffmpeg 整合測試**：以 `ffmpeg -f lavfi -i testsrc=duration=3:size=320x240:rate=10` 產生測試影片，驗證 `probeDuration`、`runFfmpeg` 的進度事件與 `ended`、非 0 結束碼與 stderr tail、`cancel()`。系統找不到 ffmpeg 時這些測試以 `ignore` 跳過。
 - **job 狀態機**：以假 CDP server + 真 ffmpeg 驗證完整成功流程、`needsConfirm`（之後狀態還原為 ready，回傳的 `finalPath` 正確）、`needsConfirm` 回傳後暫存的 main/aux 仍存在、存在檢查丟出非 NotFound 錯誤時進入 failed(process) 且暫存目錄被刪除、以 `confirmedOverwritePath` 重呼叫後覆蓋成功、拒絕覆蓋後改用另一個檔名仍能以原本擷取的檔案完成處理、兩次呼叫之間修改 `outputDir` 時許可不符而重新要求確認、處理中修改 `outputDir` 時成品仍輸出到開始時快照的資料夾、running 中取消、preparing 中取消（以一個永不結束的假 ffprobe 腳本作為 `ffprobePath`：取消後該行程被終止、ffmpeg 不會被啟動、狀態為 cancelled）、暫存目錄刪除失敗時仍進入正確的終止狀態並帶 `cleanupWarning`（以移除暫存目錄寫入權限的方式模擬）、失敗時暫存目錄都被刪除、同時發出兩個 `startProcess`（或 `startProcess` + `discard`）時只有第一個成功、終止狀態只在清理嘗試完成後出現。
 - **shutdown**：直接呼叫 `job.shutdown()`（不經視窗）分別在 idle、ready、extracting（假 CDP server 讓請求懸置）、preparing（懸置的假 ffprobe：shutdown 後 ffmpeg 從未啟動、輸出資料夾沒有任何新檔案）、running（真 ffmpeg）狀態下觸發，驗證：子行程都已結束、暫存目錄已刪除、shutdown 期間呼叫 `startProcess` 等動作被拒。publishing 階段「不中斷」由「shutdown 等待整個 `startProcess` Promise」保證；同磁碟 rename 瞬間完成，測試中難以穩定停在該階段，因此不做自動化測試。另以忽略 SIGTERM 的假 ffmpeg 腳本搭配縮短的 `deadlineMs`，驗證期限到時子行程被 SIGKILL 且 `shutdown()` 在期限內 resolve。
