@@ -30,9 +30,16 @@ export class FakeCdpServer {
   upgradeRequests = 0;
   readonly address: string;
   #server: Deno.HttpServer<Deno.NetAddr>;
+  #abort = new AbortController();
+
   constructor(options: FakeCdpOptions = {}) {
     this.#server = Deno.serve(
-      { hostname: "127.0.0.1", port: 0, onListen: () => {} },
+      {
+        hostname: "127.0.0.1",
+        port: 0,
+        onListen: () => {},
+        signal: this.#abort.signal,
+      },
       async (request) => {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return new Response("Not Found", { status: 404 });
@@ -77,20 +84,12 @@ export class FakeCdpServer {
         // Already closed.
       }
     }
-    // shutdown() stops accepting at once, but a socket upgraded after its
-    // client already gave up never finishes the handshake and would keep the
-    // graceful wait pending forever, so bound the wait.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.#server.shutdown(),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, 500);
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
+    // A socket upgraded after its client already dropped the TCP connection
+    // stays CONNECTING forever (Deno.serve does not notice the disconnect), so
+    // a graceful shutdown() would never settle. Aborting the serve signal
+    // force-closes such connections; `finished` settles once it has stopped.
+    this.#abort.abort();
+    await this.#server.finished;
   }
 }
 
