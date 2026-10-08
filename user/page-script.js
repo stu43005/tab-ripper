@@ -55,25 +55,7 @@ export default async function pageScript() {
     throw new Error("Can't find information");
   }
 
-  let key;
-  new hls.userConfig.loader().load({
-    url: "irvine://aes",
-    frag: {
-      levelkeys: {
-        identity: {
-          uri: "irvine://aes"
-        }
-      }
-    }
-  }, null, {
-    onSuccess: (obj) => {
-      key = obj.data;
-    }
-  });
-  if (!key) {
-    throw new Error("Can't find aes key");
-  }
-
+  const key = hls.streamController.keyLoader.keyUriToKeyInfo["irvine://aes"].decryptdata.key;
   const playlistUrl = hls.levelController.currentLevel.details.url;
   let m3u8 = hls.levelController.currentLevel.details.m3u8;
   m3u8 = m3u8.replaceAll("irvine://aes", "aux.bin");
@@ -95,7 +77,7 @@ export default async function pageScript() {
   const utf8encoder = new TextEncoder();
   return {
     main: utf8encoder.encode(m3u8),
-    aux: key,
+    aux: key.buffer,
     info: {
       title: info.displayName,
       playlistUrl: playlistUrl,
