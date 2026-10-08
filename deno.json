@@ -10,6 +10,13 @@
   "tasks": {
     "dev": "deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts",
     "build": "deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/TabRipper main.ts",
+    "build:macos-arm64": "deno desktop --target aarch64-apple-darwin --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/aarch64-apple-darwin/TabRipper main.ts",
+    "build:macos-x64": "deno desktop --target x86_64-apple-darwin --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/x86_64-apple-darwin/TabRipper main.ts",
+    "build:windows-x64": "deno desktop --target x86_64-pc-windows-msvc --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/x86_64-pc-windows-msvc/TabRipper main.ts",
+    "build:windows-arm64": "deno desktop --target aarch64-pc-windows-msvc --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/aarch64-pc-windows-msvc/TabRipper main.ts",
+    "build:linux-x64": "deno desktop --target x86_64-unknown-linux-gnu --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/x86_64-unknown-linux-gnu/TabRipper main.ts",
+    "build:linux-arm64": "deno desktop --target aarch64-unknown-linux-gnu --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/aarch64-unknown-linux-gnu/TabRipper main.ts",
+    "build:all": "deno task build:macos-arm64 && deno task build:macos-x64 && deno task build:windows-x64 && deno task build:windows-arm64 && deno task build:linux-x64 && deno task build:linux-arm64",
     "test": "deno test --allow-net --allow-read --allow-write --allow-run --allow-env",
     "check": "deno check main.ts src/ user/ tests/",
     "lint": "deno lint",
