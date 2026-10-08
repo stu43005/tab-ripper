@@ -11,7 +11,7 @@
     "dev": "deno desktop --hmr --allow-net --allow-read --allow-write --allow-run --allow-env main.ts",
     "build": "deno desktop --allow-net --allow-read --allow-write --allow-run --allow-env -o dist/TabRipper main.ts",
     "test": "deno test --allow-net --allow-read --allow-write --allow-run --allow-env",
-    "check": "deno check src/ user/ tests/",
+    "check": "deno check main.ts src/ user/ tests/",
     "lint": "deno lint",
     "fmt": "deno fmt"
   }
