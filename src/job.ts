@@ -1,10 +1,15 @@
+import { join, resolve } from "@std/path";
 import { browserWsUrl } from "./cdp/address.ts";
 import { CdpClient, CdpClosedError } from "./cdp/client.ts";
 import { extractFromTab } from "./extract.ts";
+import { type FfmpegRun, probeDuration, runFfmpeg } from "./ffmpeg.ts";
+import { sanitizeFilename } from "./filename.ts";
+import { publishOutput } from "./publish.ts";
 import { SESSION_ID } from "./session.ts";
 import { listTabs } from "./tabs.ts";
 import type { ExtractResult, JobStatus, Settings, TabInfo } from "./types.ts";
-import { URL_PATTERN } from "../user/config.ts";
+import { PROBE_DURATION, URL_PATTERN } from "../user/config.ts";
+import { buildFfmpegArgs } from "../user/ffmpeg-args.ts";
 import { defaultFilename, INFO_COLUMNS } from "../user/info.ts";
 
 export const BUSY_MESSAGE = "目前有工作進行中";
@@ -15,6 +20,27 @@ export const ADDRESS_CHANGED_MESSAGE = "CDP 位址已變更，請重新連線";
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface ProcessContext {
+  settings: Settings;
+  name: string;
+  finalPath: string;
+  confirmedOverwritePath: string | null;
+  tempDir: string;
+  extracted: ExtractResult;
+  readyStatus: JobStatus;
+  abort: AbortController;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await Deno.lstat(path);
+    return true;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return false;
+    throw error;
+  }
 }
 
 /**
@@ -33,6 +59,11 @@ export class JobManager {
   #lastFilename: string | null = null;
   /** The running extract/process work, awaited by shutdown. */
   #work: Promise<void> | null = null;
+  #cancelRequested = false;
+  #abort: AbortController | null = null;
+  #run: FfmpegRun | null = null;
+  /** Set when the last duration probe failed; shown on the settings page. */
+  #probeWarning: string | null = null;
 
   constructor(settings: Settings) {
     this.#settings = { ...settings };
@@ -65,6 +96,16 @@ export class JobManager {
 
   get isShuttingDown(): boolean {
     return this.#shuttingDown;
+  }
+
+  /** Warning from the most recent failed ffprobe duration probe, if any. */
+  get probeWarning(): string | null {
+    return this.#probeWarning;
+  }
+
+  /** The URL pattern as text, for the tab list's empty state. */
+  get urlPattern(): string {
+    return String(URL_PATTERN);
   }
 
   getStatus(): JobStatus {
@@ -164,6 +205,237 @@ export class JobManager {
       throw new Error(BUSY_MESSAGE);
     }
     this.#status = { state: "idle" };
+  }
+
+  /**
+   * Everything before the first await is synchronous
+   * (state switch + settings snapshot). Resolves once the destination checks
+   * are done; processing then continues in the background.
+   */
+  async startProcess(
+    filename: string,
+    confirmedOverwritePath: string | null,
+  ): Promise<{ needsConfirm: boolean; finalPath: string }> {
+    if (this.#shuttingDown) throw new Error(SHUTTING_DOWN_MESSAGE);
+    if (
+      this.#status.state !== "ready" || this.#tempDir === null ||
+      this.#extracted === null
+    ) {
+      throw new Error(BUSY_MESSAGE);
+    }
+    const name = sanitizeFilename(filename);
+    // Snapshot with an absolute output dir: confirmation, publishing and the
+    // result all use this exact path even if settings or cwd change later.
+    const settings = {
+      ...this.#settings,
+      outputDir: resolve(this.#settings.outputDir),
+    };
+    const ctx: ProcessContext = {
+      settings,
+      name,
+      finalPath: join(settings.outputDir, name),
+      confirmedOverwritePath,
+      tempDir: this.#tempDir,
+      extracted: this.#extracted,
+      readyStatus: this.#status,
+      abort: new AbortController(),
+    };
+    this.#lastFilename = name;
+    this.#cancelRequested = false;
+    this.#abort = ctx.abort;
+    this.#status = {
+      state: "processing",
+      phase: "preparing",
+      percent: null,
+      outTimeSec: 0,
+      durationSec: null,
+      speed: null,
+      message: null,
+    };
+    let signalPrepared!: (needsConfirm: boolean) => void;
+    const prepared = new Promise<boolean>((resolve) => {
+      signalPrepared = resolve;
+    });
+    this.#track(this.#runProcess(ctx, signalPrepared));
+    return { needsConfirm: await prepared, finalPath: ctx.finalPath };
+  }
+
+  cancel(): void {
+    const status = this.#status;
+    if (status.state !== "processing") throw new Error("目前沒有進行中的處理");
+    if (status.phase === "publishing") return; // Publishing is never interrupted.
+    this.#cancelRequested = true;
+    this.#abort?.abort();
+    this.#run?.cancel();
+  }
+
+  async #runProcess(
+    ctx: ProcessContext,
+    signalPrepared: (needsConfirm: boolean) => void,
+  ): Promise<void> {
+    const outDir = join(ctx.tempDir, "out");
+    const tempOutput = join(outDir, ctx.name);
+    // remove-all: terminal outcome. keep-inputs: destination failure, keep
+    // main/aux for a retry. keep-all: overwrite confirmation pending.
+    let cleanup: "remove-all" | "keep-inputs" | "keep-all" = "remove-all";
+    let next: JobStatus = { state: "cancelled" };
+    let destinationError = "";
+    try {
+      try {
+        await Deno.mkdir(ctx.settings.outputDir, { recursive: true });
+        if (this.#cancelRequested) return;
+        const exists = await pathExists(ctx.finalPath);
+        if (this.#cancelRequested) return;
+        if (exists && ctx.confirmedOverwritePath !== ctx.finalPath) {
+          cleanup = "keep-all";
+          next = ctx.readyStatus;
+          return;
+        }
+      } catch (error) {
+        if (!this.#cancelRequested) {
+          cleanup = "keep-inputs";
+          destinationError = `輸出失敗：${errorMessage(error)}`;
+          next = this.#readyStatus(destinationError);
+        }
+        return;
+      }
+      signalPrepared(false);
+      if (this.#cancelRequested) return;
+
+      const durationSec = PROBE_DURATION
+        ? await probeDuration(
+          ctx.settings.ffprobePath,
+          ctx.extracted.mainPath,
+          ctx.abort.signal,
+        )
+        : null;
+      if (this.#cancelRequested) return;
+      // The duration probe is authoritative for the progress mode; a failure
+      // is surfaced as a settings warning and processing continues.
+      if (PROBE_DURATION) {
+        this.#probeWarning = durationSec === null
+          ? "無法以 ffprobe 取得長度，進度改為不確定顯示；請檢查 ffprobe 路徑"
+          : null;
+      }
+      // Start from an empty out/: a leftover from an earlier failed attempt
+      // must never be mistaken for this run's output.
+      await Deno.remove(outDir, { recursive: true }).catch((error) => {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      });
+      await Deno.mkdir(outDir, { recursive: true });
+      if (this.#cancelRequested) return;
+
+      this.#status = {
+        state: "processing",
+        phase: "running",
+        percent: durationSec === null ? null : 0,
+        outTimeSec: 0,
+        durationSec,
+        speed: null,
+        message: null,
+      };
+      const run = runFfmpeg({
+        ffmpegPath: ctx.settings.ffmpegPath,
+        args: buildFfmpegArgs({
+          mainPath: ctx.extracted.mainPath,
+          auxPath: ctx.extracted.auxPath,
+          info: ctx.extracted.info,
+          outputPath: tempOutput,
+        }),
+        durationSec,
+        onProgress: (update) => {
+          const status = this.#status;
+          if (status.state === "processing" && status.phase === "running") {
+            this.#status = { state: "processing", phase: "running", ...update };
+          }
+        },
+      });
+      this.#run = run;
+      const { code, stderrTail } = await run.done;
+      this.#run = null;
+      if (this.#cancelRequested) return;
+      if (code !== 0) {
+        next = {
+          state: "failed",
+          stage: "process",
+          message: `ffmpeg 執行失敗（結束碼 ${code}）`,
+          detail: stderrTail.slice(-20),
+        };
+        return;
+      }
+      const produced = await pathExists(tempOutput);
+      // Cancellation (user or shutdown) during the check must still win.
+      if (this.#cancelRequested) return;
+      if (!produced) {
+        next = {
+          state: "failed",
+          stage: "process",
+          message:
+            "ffmpeg 未產生輸出檔，請檢查 buildFfmpegArgs 是否寫入 outputPath",
+        };
+        return;
+      }
+      const running = this.#status;
+      if (running.state === "processing") {
+        this.#status = { ...running, phase: "publishing" };
+      }
+      try {
+        await publishOutput(tempOutput, ctx.finalPath);
+      } catch (error) {
+        cleanup = "keep-inputs";
+        destinationError = `輸出失敗：${errorMessage(error)}`;
+        next = this.#readyStatus(destinationError);
+        return;
+      }
+      next = { state: "done", outputPath: ctx.finalPath };
+    } catch (error) {
+      cleanup = "remove-all";
+      next = this.#cancelRequested
+        ? { state: "cancelled" }
+        : { state: "failed", stage: "process", message: errorMessage(error) };
+    } finally {
+      this.#run = null;
+      this.#abort = null;
+      if (cleanup === "keep-inputs") {
+        try {
+          await Deno.remove(outDir, { recursive: true });
+        } catch (error) {
+          if (!(error instanceof Deno.errors.NotFound)) {
+            // Report the leftover; the next run clears out/ before starting ffmpeg.
+            next = this.#readyStatus(
+              `${destinationError}；暫存輸出未能刪除：${outDir}（${
+                errorMessage(error)
+              }）`,
+            );
+          }
+        }
+        // A cancel accepted during that await wins: clean everything up.
+        if (this.#cancelRequested) {
+          cleanup = "remove-all";
+          next = { state: "cancelled" };
+        }
+      }
+      if (cleanup === "remove-all") {
+        const warning = await this.#removeTempDir(ctx.tempDir);
+        this.#tempDir = null;
+        this.#extracted = null;
+        this.#lastFilename = null;
+        // A cancel accepted while cleaning up after a failure is honoured.
+        if (this.#cancelRequested && next.state === "failed") {
+          next = { state: "cancelled" };
+        }
+        if (
+          warning &&
+          (next.state === "done" || next.state === "failed" ||
+            next.state === "cancelled")
+        ) {
+          next = { ...next, cleanupWarning: warning };
+        }
+      }
+      // Status first, then release startProcess: callers never see a stale state.
+      this.#status = next;
+      signalPrepared(cleanup === "keep-all");
+    }
   }
 
   async #runExtract(client: CdpClient, targetId: string): Promise<void> {
