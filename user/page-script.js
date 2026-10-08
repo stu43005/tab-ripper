@@ -33,7 +33,7 @@ export default async function pageScript() {
     return refs;
   }
 
-  const dom = document.querySelector("div[class*='VideoPlayer_videoWrapper");
+  const dom = document.querySelector("div[class*='VideoPlayer_videoWrapper']");
 
   let hls, info;
   for (const fiber of getAllHookFiber(dom)) {
