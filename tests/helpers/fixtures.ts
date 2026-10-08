@@ -1,4 +1,6 @@
 import { join } from "@std/path";
+import { systemTempRoot } from "../../src/cleanup.ts";
+import { SESSION_ID } from "../../src/session.ts";
 
 /** True when a working ffmpeg is on PATH; ffmpeg-dependent tests use `ignore: !FFMPEG`. */
 export const FFMPEG: boolean = await (async () => {
@@ -84,4 +86,17 @@ export async function listDir(dir: string): Promise<string[]> {
   const names: string[] = [];
   for await (const entry of Deno.readDir(dir)) names.push(entry.name);
   return names.sort();
+}
+
+/** Temp dirs created by JobManager in this process (prefix `ffdl-<SESSION_ID>-`). */
+export async function sessionTempDirs(): Promise<string[]> {
+  const root = await systemTempRoot();
+  return (await listDir(root))
+    .filter((name) => name.startsWith(`ffdl-${SESSION_ID}-`))
+    .map((name) => join(root, name));
+}
+
+/** Session temp dirs that did not exist in `before`. */
+export async function newSessionTempDirs(before: string[]): Promise<string[]> {
+  return (await sessionTempDirs()).filter((dir) => !before.includes(dir));
 }

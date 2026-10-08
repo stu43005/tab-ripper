@@ -1,8 +1,11 @@
 import { browserWsUrl } from "./cdp/address.ts";
 import { CdpClient, CdpClosedError } from "./cdp/client.ts";
+import { extractFromTab } from "./extract.ts";
+import { SESSION_ID } from "./session.ts";
 import { listTabs } from "./tabs.ts";
-import type { JobStatus, Settings, TabInfo } from "./types.ts";
+import type { ExtractResult, JobStatus, Settings, TabInfo } from "./types.ts";
 import { URL_PATTERN } from "../user/config.ts";
+import { defaultFilename, INFO_COLUMNS } from "../user/info.ts";
 
 export const BUSY_MESSAGE = "目前有工作進行中";
 export const SHUTTING_DOWN_MESSAGE = "程式正在結束";
@@ -24,6 +27,12 @@ export class JobManager {
   #client: CdpClient | null = null;
   #connecting: Promise<void> | null = null;
   #shuttingDown = false;
+  #tempDir: string | null = null;
+  #extracted: ExtractResult | null = null;
+  /** Last filename the user submitted; reused when returning to ready. */
+  #lastFilename: string | null = null;
+  /** The running extract/process work, awaited by shutdown. */
+  #work: Promise<void> | null = null;
 
   constructor(settings: Settings) {
     this.#settings = { ...settings };
@@ -117,5 +126,116 @@ export class JobManager {
       }
       throw error;
     }
+  }
+
+  extract(targetId: string): void {
+    if (this.#shuttingDown) throw new Error(SHUTTING_DOWN_MESSAGE);
+    const state = this.#status.state;
+    if (
+      state !== "idle" && state !== "done" && state !== "failed" &&
+      state !== "cancelled"
+    ) {
+      throw new Error(BUSY_MESSAGE);
+    }
+    const client = this.#client;
+    if (!client) throw new Error(NOT_CONNECTED_MESSAGE);
+    // Synchronous state switch: overlapping calls see "extracting".
+    this.#status = { state: "extracting", received: 0, total: 0 };
+    this.#track(this.#runExtract(client, targetId));
+  }
+
+  discard(): void {
+    if (this.#shuttingDown) throw new Error(SHUTTING_DOWN_MESSAGE);
+    if (this.#status.state !== "ready") throw new Error(BUSY_MESSAGE);
+    const dir = this.#detachReadyFiles();
+    if (dir) {
+      Deno.remove(dir, { recursive: true }).catch((error) =>
+        console.warn(
+          `[tab-ripper] could not remove ${dir}: ${errorMessage(error)}`,
+        )
+      );
+    }
+  }
+
+  reset(): void {
+    if (this.#shuttingDown) throw new Error(SHUTTING_DOWN_MESSAGE);
+    const state = this.#status.state;
+    if (state !== "done" && state !== "failed" && state !== "cancelled") {
+      throw new Error(BUSY_MESSAGE);
+    }
+    this.#status = { state: "idle" };
+  }
+
+  async #runExtract(client: CdpClient, targetId: string): Promise<void> {
+    let tempDir: string | null = null;
+    try {
+      tempDir = await Deno.makeTempDir({ prefix: `ffdl-${SESSION_ID}-` });
+      this.#tempDir = tempDir;
+      const result = await extractFromTab(
+        client,
+        targetId,
+        tempDir,
+        (received, total) => {
+          if (this.#status.state === "extracting") {
+            this.#status = { state: "extracting", received, total };
+          }
+        },
+      );
+      this.#extracted = result;
+      this.#lastFilename = null;
+      this.#status = this.#readyStatus();
+    } catch (error) {
+      const warning = tempDir ? await this.#removeTempDir(tempDir) : undefined;
+      this.#tempDir = null;
+      this.#extracted = null;
+      this.#status = {
+        state: "failed",
+        stage: "extract",
+        message: errorMessage(error),
+        ...(warning ? { cleanupWarning: warning } : {}),
+      };
+    }
+  }
+
+  #readyStatus(lastError?: string): JobStatus {
+    const extracted = this.#extracted;
+    if (!extracted) throw new Error("internal error: no extracted files");
+    return {
+      state: "ready",
+      info: extracted.info,
+      columns: INFO_COLUMNS,
+      mainSize: extracted.mainSize,
+      auxSize: extracted.auxSize,
+      defaultFilename: this.#lastFilename ?? defaultFilename(extracted.info),
+      ...(lastError ? { lastError } : {}),
+    };
+  }
+
+  /** Clears ready-state files from the job and returns the temp dir to delete. */
+  #detachReadyFiles(): string | null {
+    const dir = this.#tempDir;
+    this.#tempDir = null;
+    this.#extracted = null;
+    this.#lastFilename = null;
+    this.#status = { state: "idle" };
+    return dir;
+  }
+
+  /** Returns a cleanup warning instead of throwing. */
+  async #removeTempDir(dir: string): Promise<string | undefined> {
+    try {
+      await Deno.remove(dir, { recursive: true });
+      return undefined;
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return undefined;
+      return `暫存檔未能刪除：${dir}（${errorMessage(error)}）`;
+    }
+  }
+
+  #track(work: Promise<void>): void {
+    const tracked: Promise<void> = work.finally(() => {
+      if (this.#work === tracked) this.#work = null;
+    });
+    this.#work = tracked;
   }
 }
