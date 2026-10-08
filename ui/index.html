@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <title>Tab Ripper</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Tab Ripper</h1>
+      <button id="open-settings" type="button">設定</button>
+    </header>
+
+    <main>
+      <section id="screen-connect" class="screen" hidden>
+        <h2>連線到瀏覽器</h2>
+        <div id="connect-closed">
+          <p>
+            請在瀏覽器網址列開啟 <code>chrome://inspect/#remote-debugging</code>
+            並打開遠端偵錯開關（Brave 也可直接使用此網址）。
+          </p>
+          <p
+            class="muted">探測位址：<code id="probe-address"></code>（每 2 秒自動重試）</p>
+          <button id="probe-retry" type="button">重試</button>
+        </div>
+        <div id="connect-open" hidden>
+          <p>偵測到瀏覽器偵錯埠：<code id="probe-address-open"></code></p>
+          <button id="connect-button" type="button"
+            class="primary">連線</button>
+          <p id="connect-hint" class="muted"
+            hidden>請在瀏覽器跳出的對話框按允許…</p>
+        </div>
+        <p id="connect-error" class="error" hidden></p>
+      </section>
+
+      <section id="screen-tabs" class="screen" hidden>
+        <div class="row">
+          <h2>選擇分頁</h2>
+          <button id="tabs-refresh" type="button">重新整理</button>
+        </div>
+        <ul id="tab-list" class="tab-list"></ul>
+        <p id="tabs-empty" class="muted"
+          hidden>沒有符合網址規則的分頁：<code id="tabs-pattern"></code></p>
+        <p id="tabs-error" class="error" hidden></p>
+      </section>
+
+      <section id="screen-extracting" class="screen" hidden>
+        <h2>擷取中</h2>
+        <progress id="extract-progress" max="1" value="0"></progress>
+        <p id="extract-bytes"></p>
+        <p class="warning">關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束</p>
+      </section>
+
+      <section id="screen-preview" class="screen" hidden>
+        <h2>確認資訊</h2>
+        <p id="preview-error" class="error banner" hidden></p>
+        <table id="info-table" class="info-table">
+          <tbody></tbody>
+        </table>
+        <label
+          class="field">輸出檔名 <input id="filename" type="text" spellcheck="false"></label>
+        <p id="tool-warning" class="error"
+          hidden>ffmpeg 無法執行，請到設定修正 ffmpeg 路徑。</p>
+        <div class="actions">
+          <button id="discard-button" type="button">取消</button>
+          <button id="start-button" type="button"
+            class="primary">開始處理</button>
+        </div>
+      </section>
+
+      <section id="screen-processing" class="screen" hidden>
+        <h2 id="processing-title">處理中</h2>
+        <progress id="process-progress" max="100"></progress>
+        <p id="process-detail"></p>
+        <p id="process-message" class="mono ellipsis"></p>
+        <p id="process-error" class="error" hidden></p>
+        <p class="warning">關閉視窗會中斷目前工作；請用 Cmd+Q 安全結束</p>
+        <div class="actions">
+          <button id="cancel-button" type="button">取消</button>
+        </div>
+      </section>
+
+      <section id="screen-result" class="screen" hidden>
+        <h2 id="result-title"></h2>
+        <p id="result-message"></p>
+        <pre id="result-detail" class="mono" hidden></pre>
+        <p id="result-cleanup" class="warning" hidden></p>
+        <p id="result-error" class="error" hidden></p>
+        <div class="actions">
+          <button id="reveal-button" type="button"
+            hidden>在 Finder 中顯示</button>
+          <button id="again-button" type="button"
+            class="primary">再一次</button>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="settings-dialog">
+      <form id="settings-form" method="dialog">
+        <h2>設定</h2>
+        <p id="settings-warning" class="warning" hidden></p>
+        <label
+          class="field">CDP 位址 <input name="cdpAddress" type="text" spellcheck="false"></label>
+        <label
+          class="field">輸出資料夾 <input name="outputDir" type="text" spellcheck="false"></label>
+        <label
+          class="field">ffmpeg 路徑 <input name="ffmpegPath" type="text" spellcheck="false"></label>
+        <p id="tool-ffmpeg" class="muted"></p>
+        <label
+          class="field">ffprobe 路徑 <input name="ffprobePath" type="text" spellcheck="false"></label>
+        <p id="tool-ffprobe" class="muted"></p>
+        <p id="probe-warning" class="warning" hidden></p>
+        <p id="settings-error" class="error" hidden></p>
+        <div class="actions">
+          <button id="settings-close" type="button">關閉</button>
+          <button id="settings-save" type="button" class="primary">儲存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="shutdown-overlay" class="overlay" hidden>正在結束…</div>
+    <script src="/app.js"></script>
+  </body>
+</html>
