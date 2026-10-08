@@ -1,5 +1,4 @@
 import { join } from "@std/path";
-import { killAllChildren } from "../../src/ffmpeg.ts";
 import { JobManager } from "../../src/job.ts";
 import type { JobStatus, Settings } from "../../src/types.ts";
 import { FakeCdpServer } from "./fake_cdp.ts";
@@ -41,7 +40,7 @@ export async function connectedJob(
     outputDir,
     settings,
     async dispose() {
-      killAllChildren();
+      await job.shutdown({ deadlineMs: 3000 });
       await server.close();
       await Deno.chmod(workDir, 0o755).catch(() => {});
       await Deno.remove(workDir, { recursive: true });

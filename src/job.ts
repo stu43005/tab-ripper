@@ -2,7 +2,12 @@ import { join, resolve } from "@std/path";
 import { browserWsUrl } from "./cdp/address.ts";
 import { CdpClient, CdpClosedError } from "./cdp/client.ts";
 import { extractFromTab } from "./extract.ts";
-import { type FfmpegRun, probeDuration, runFfmpeg } from "./ffmpeg.ts";
+import {
+  type FfmpegRun,
+  killAllChildren,
+  probeDuration,
+  runFfmpeg,
+} from "./ffmpeg.ts";
 import { sanitizeFilename } from "./filename.ts";
 import { publishOutput } from "./publish.ts";
 import { SESSION_ID } from "./session.ts";
@@ -62,6 +67,7 @@ export class JobManager {
   #cancelRequested = false;
   #abort: AbortController | null = null;
   #run: FfmpegRun | null = null;
+  #shutdownPromise: Promise<void> | null = null;
   /** Set when the last duration probe failed; shown on the settings page. */
   #probeWarning: string | null = null;
 
@@ -267,6 +273,65 @@ export class JobManager {
     this.#cancelRequested = true;
     this.#abort?.abort();
     this.#run?.cancel();
+  }
+
+  /**
+   * Graceful shutdown for the Cmd+Q path. Blocks new
+   * state-changing calls, winds down the current job, closes the CDP
+   * connection, and always ends with killAllChildren() because Deno.exit()
+   * does not terminate child processes.
+   */
+  shutdown(opts: { deadlineMs?: number } = {}): Promise<void> {
+    if (this.#shutdownPromise) return this.#shutdownPromise;
+    this.#shuttingDown = true;
+    this.#shutdownPromise = this.#runShutdown(opts.deadlineMs ?? 10_000);
+    return this.#shutdownPromise;
+  }
+
+  async #runShutdown(deadlineMs: number): Promise<void> {
+    const graceful = (async () => {
+      const status = this.#status;
+      if (status.state === "extracting") {
+        this.#client?.close(); // Pending CDP requests reject immediately.
+      } else if (
+        status.state === "processing" && status.phase !== "publishing"
+      ) {
+        this.cancel();
+      }
+      // Publishing is awaited, never interrupted.
+      await this.#work?.catch(() => {});
+      // Ready-state files are cleaned after the work settles: the job may have
+      // been ready from the start, or returned to ready after a publish failure.
+      if (this.#status.state === "ready") {
+        const dir = this.#detachReadyFiles();
+        if (dir) await Deno.remove(dir, { recursive: true }).catch(() => {});
+      }
+      await this.#connecting?.catch(() => {});
+      this.#client?.close();
+      this.#client = null;
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, deadlineMs);
+    });
+    await Promise.race([graceful, deadline]);
+    clearTimeout(timer);
+    killAllChildren();
+  }
+
+  /**
+   * Close-button path: the process dies right after the close
+   * event, so only synchronous, best-effort cleanup is possible.
+   */
+  abortSync(): void {
+    killAllChildren();
+    const dir = this.#tempDir;
+    if (!dir) return;
+    try {
+      Deno.removeSync(dir, { recursive: true });
+    } catch {
+      // Startup cleanup retries leftovers on the next launch.
+    }
   }
 
   async #runProcess(
